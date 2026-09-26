@@ -2326,8 +2326,9 @@ test("cold start timeout aborts, includes worker diagnostics, and a retry re-war
   const h = harness({ coldStartTimeoutSec: 60 })
   h.compute.diagnosticsText = "CUDA out of memory\nworker exited"
   const { pending } = await startWarming(h)
+  const rejected = assert.rejects(pending, /timed out after 60s.*Worker log tail:\nCUDA out of memory\nworker exited/s)
   await h.clock.advance(60_000)
-  await assert.rejects(pending, /timed out after 60s.*Worker log tail:\nCUDA out of memory\nworker exited/s)
+  await rejected
   assert.equal(h.service.phase("m"), "cold")
   const retry = h.service.ensureReady("m")
   await flush()

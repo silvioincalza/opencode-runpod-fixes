@@ -102,3 +102,36 @@ test("errors from the operations port are reported as text, never thrown", async
   await run(defs, "runpod-add", "org/repo")
   assert.equal(replies.at(-1), "RunPod: already exists")
 })
+
+test("parseArgs keeps quoted spans together and strips their quotes", () => {
+  assert.deepEqual(parseArgs('/runpod-set m name="My Model" context=8192'), ["m", "name=My Model", "context=8192"])
+  assert.deepEqual(parseArgs("/runpod-set m name='Coder'"), ["m", "name=Coder"])
+  assert.deepEqual(parseArgs('/runpod-add "org/repo"'), ["org/repo"])
+  assert.deepEqual(parseArgs('/runpod-set m name=""'), ["m", "name="])
+  assert.throws(() => parseArgs('/runpod-set m name="oops'), /unterminated " quote/)
+})
+
+test("quoted names reach set; add checks the repo id before parsing overrides; non-Error throws reply as text", async () => {
+  const { h, defs } = host()
+  const o = ops({
+    status: async () => {
+      throw "plain string failure"
+    },
+  })
+  const replies: string[] = []
+  await registerCommands(h, o, async (_s, text) => {
+    replies.push(text)
+  })
+  await run(defs, "runpod-set", '/runpod-set m name="Qwen3 Coder (RunPod)"')
+  assert.equal(o.calls.at(-1), 'set:m:{"name":"Qwen3 Coder (RunPod)"}')
+  const before = o.calls.length
+  await run(defs, "runpod-add", "/runpod-add foo=bar")
+  assert.equal(replies.at(-1), "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]")
+  await run(defs, "runpod-add", "/runpod-add not-a-repo context=4096")
+  assert.equal(replies.at(-1), 'hf: expected a Hugging Face repo id like org/name, got "not-a-repo"')
+  assert.equal(o.calls.length, before) // neither malformed add reached the operations port
+  await run(defs, "runpod-set", '/runpod-set m name="oops')
+  assert.match(replies.at(-1)!, /unterminated " quote/)
+  await run(defs, "runpod-status", "")
+  assert.equal(replies.at(-1), "plain string failure")
+})

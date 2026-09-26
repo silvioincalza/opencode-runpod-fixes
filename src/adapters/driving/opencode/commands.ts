@@ -1,6 +1,6 @@
 import type { OperationsPort } from "../../../core/ports/driving.ts"
 import { formatModel, formatStatus } from "../rpc/format.ts"
-import { OVERRIDE_KEYS, parseOverrides } from "./config.ts"
+import { ConfigError, OVERRIDE_KEYS, parseOverrides } from "./config.ts"
 
 export interface CommandInvocationLike {
   sessionID: string
@@ -21,9 +21,32 @@ export interface CommandHost {
 
 export type Reply = (sessionID: string, text: string) => Promise<void>
 
-/** Whitespace-separated arguments after the slash command token. */
+/** Arguments after the slash command token: split on whitespace; a "…" or '…' span (anywhere in a token, e.g. name="My Model") keeps its spaces and loses its quotes. */
 export function parseArgs(text: string): string[] {
-  return text.trim().replace(/^\/\S+\s*/, "").split(/\s+/).filter((s) => s.length > 0)
+  const rest = text.trim().replace(/^\/\S+\s*/, "")
+  const out: string[] = []
+  let token = ""
+  let inToken = false
+  let quote: string | null = null
+  for (const ch of rest) {
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      else token += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      inToken = true
+    } else if (/\s/.test(ch)) {
+      if (inToken) out.push(token)
+      token = ""
+      inToken = false
+    } else {
+      token += ch
+      inToken = true
+    }
+  }
+  if (quote !== null) throw new ConfigError(`unterminated ${quote} quote in command arguments`)
+  if (inToken) out.push(token)
+  return out
 }
 
 const SET_USAGE = `Usage: /runpod-set <model-id> key=value [key=value …] (keys: ${OVERRIDE_KEYS.join(", ")})`
@@ -32,7 +55,7 @@ export async function registerCommands(host: CommandHost, ops: OperationsPort, r
   const guarded = (sessionID: string, action: () => Promise<string>) =>
     action().then(
       (text) => reply(sessionID, text),
-      (error: unknown) => reply(sessionID, (error as Error).message),
+      (error: unknown) => reply(sessionID, error instanceof Error ? error.message : String(error)),
     )
 
   await host.command.transform((editor) => {
@@ -67,11 +90,10 @@ export async function registerCommands(host: CommandHost, ops: OperationsPort, r
       execute: ({ sessionID, prompt }) =>
         guarded(sessionID, async () => {
           const [hf, ...rest] = parseArgs(prompt.text)
-          if (!hf) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
-          const gpu = rest[0] !== undefined && !rest[0].includes("=") ? rest.shift() : undefined
-          const overrides = parseOverrides([...(hf.includes("=") ? [hf] : []), ...rest])
-          if (hf.includes("=")) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
+          if (!hf || hf.includes("=")) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
           if (!/^[\w.-]+\/[\w.-]+$/.test(hf)) return `hf: expected a Hugging Face repo id like org/name, got "${hf}"`
+          const gpu = rest[0] !== undefined && !rest[0].includes("=") ? rest.shift() : undefined
+          const overrides = parseOverrides(rest)
           const added = await ops.add({ hf, ...(gpu === undefined ? {} : { gpu }), overrides })
           return `Added runpod/${added.id} · ${formatModel(added)}\nSelect it in /models; the first request shows the provision dialog.`
         }),

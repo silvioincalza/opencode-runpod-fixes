@@ -6608,6 +6608,11 @@ export default Plugin.define({
     const knownPools = new RunpodPriceCatalog(null, clock).knownPools()
     const { settings, secrets } = resolveSettings(ctx.options, { knownPools })
 
+    // An explicit secret option that does not resolve is not replaced by the environment (Task 12); say so up front.
+    const rawOptions = (ctx.options ?? {}) as { apiKey?: unknown; hfToken?: unknown }
+    if (rawOptions.apiKey !== undefined && secrets.apiKey === null) logger.warn("options.apiKey is set but did not resolve — check the referenced env var or file")
+    if (rawOptions.hfToken !== undefined && secrets.hfToken === null) logger.warn("options.hfToken is set but did not resolve — check the referenced env var or file")
+
     const http = secrets.apiKey ? new RunpodHttp({ apiKey: secrets.apiKey }) : null
     const compute = http ? new RunpodComputeProvider(http) : null
     const catalog = new RunpodPriceCatalog(http, clock)

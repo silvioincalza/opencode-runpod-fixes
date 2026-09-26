@@ -3573,7 +3573,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { RunpodError, RunpodHttp } from "../src/adapters/driven/runpod/http.ts"
 
-type Handler = (url: string, init: RequestInit) => Response | Promise<Response>
+type Handler = Response | ((url: string, init: RequestInit) => Response | Promise<Response>)
 
 function fakeFetch(handlers: Handler[]) {
   const calls: { url: string; init: RequestInit }[] = []
@@ -3582,7 +3582,7 @@ function fakeFetch(handlers: Handler[]) {
     calls.push({ url, init: init ?? {} })
     const handler = handlers.shift()
     if (!handler) throw new Error(`unexpected fetch ${url}`)
-    return handler(url, init ?? {})
+    return typeof handler === "function" ? handler(url, init ?? {}) : handler
   }) as unknown as typeof fetch
   return { fetchImpl, calls }
 }
@@ -3616,6 +3616,16 @@ test("problem+json errors become RunpodError with status, title and detail", asy
     assert.equal(error.title, "Bad Request")
     assert.equal(error.detail, "gpu.pools is required")
     assert.match(error.message, /RunPod 400 Bad Request: gpu\.pools is required/)
+    return true
+  })
+})
+
+test("error bodies that echo the API key are redacted", async () => {
+  const { c } = client([json(401, { title: "Unauthorized", detail: "invalid key rp_key" })])
+  await assert.rejects(c.listEndpoints(), (error: unknown) => {
+    assert.ok(error instanceof RunpodError)
+    assert.equal(error.detail, "invalid key [redacted]")
+    assert.ok(!error.message.includes("rp_key"))
     return true
   })
 })
@@ -3846,8 +3856,8 @@ export class RunpodHttp {
 
   async health(endpointId: string): Promise<HealthInfo> {
     const raw = (await this.request<Partial<HealthInfo> | null>("GET", `${this.runtimeBase}/${endpointId}/health`)) ?? {}
-    const w = raw.workers ?? {}
-    const j = raw.jobs ?? {}
+    const w: Partial<HealthInfo["workers"]> = raw.workers ?? {}
+    const j: Partial<HealthInfo["jobs"]> = raw.jobs ?? {}
     return {
       jobs: { completed: j.completed ?? 0, failed: j.failed ?? 0, inProgress: j.inProgress ?? 0, inQueue: j.inQueue ?? 0, retried: j.retried ?? 0 },
       workers: { idle: w.idle ?? 0, initializing: w.initializing ?? 0, ready: w.ready ?? 0, running: w.running ?? 0, throttled: w.throttled ?? 0 },
@@ -3898,7 +3908,12 @@ export class RunpodHttp {
     } catch {
       // non-JSON error body: keep the status text
     }
-    return new RunpodError(response.status, title, detail, context)
+    return new RunpodError(response.status, this.redact(title), detail === null ? null : this.redact(detail), context)
+  }
+
+  /** Error bodies come from the server; never let them carry the API key into messages, logs or toasts. */
+  private redact(text: string): string {
+    return this.apiKey.length > 0 ? text.split(this.apiKey).join("[redacted]") : text
   }
 }
 

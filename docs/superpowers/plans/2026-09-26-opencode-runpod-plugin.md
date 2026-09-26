@@ -31,26 +31,28 @@ runpod-opencode/
 ├─ package.json  tsconfig.json  .opencode/opencode.jsonc  README.md  examples/opencode.jsonc  scripts/smoke.ts
 ├─ index.ts → src/adapters/driving/opencode/plugin.ts   tui.ts → src/adapters/driving/tui/plugin.tsx   rpc.ts → src/adapters/driving/rpc/contract.ts
 ├─ src/core/domain/
-│  ├─ model.ts          ModelConfig, Settings, findModel
+│  ├─ model.ts          ModelConfig, Settings, findModel, MODEL_ID_PATTERN, ModelOverrides, idleTimeoutFor, applyOverrides, deriveModelID
 │  ├─ endpoint.ts       Phase, WorkerRecipe, EndpointSpec, EndpointRecord, ENDPOINT_PREFIX, endpointName, modelIDFromName, specHash, specHashFor, buildEndpointSpec
-│  ├─ quote.ts          PoolRate, Quote, DEFAULT_WEIGHTS_GB, estimateColdStartSec, idleWindowUsd, buildQuote
+│  ├─ quote.ts          PoolRate, Quote, DEFAULT_WEIGHTS_GB, FIT_FACTOR, fitsPool, estimateColdStartSec, idleWindowUsd, buildQuote
+│  ├─ provision.ts      GpuOption, ProvisionProposal, ProvisionOverrides, ProvisionDecision, IDLE_TIMEOUT_CHOICES, PoolPricing, buildGpuOptions, buildProposal, gpuVariantsFor
 │  ├─ spend-meter.ts    SpendMeter
-│  └─ events.ts         StateEvent, NoticeLevel, ModelStatus, StatusReport
+│  └─ events.ts         StateEvent, NoticeLevel, WorkerCounts, ModelStatus, StatusReport
 ├─ src/core/ports/
 │  ├─ compute-provider.ts  ComputeProviderPort, RemoteEndpoint, HealthSnapshot, ComputeError
 │  ├─ price-catalog.ts  PriceCatalogPort        ├─ worker-recipe.ts  WorkerRecipePort      ├─ weights-info.ts  WeightsInfoPort
 │  ├─ state-store.ts    StateStorePort          ├─ clock.ts          ClockPort             ├─ confirmation.ts  ConfirmationPort
-│  ├─ notifier.ts       NotifierPort            ├─ logger.ts         LoggerPort            └─ driving.ts       ModelRoutingPort, OperationsPort, LifecyclePort
+│  ├─ notifier.ts       NotifierPort            ├─ logger.ts         LoggerPort            ├─ catalog-publisher.ts  CatalogPublisherPort, PublishedModel
+│  └─ driving.ts        ModelRoutingPort, OperationsPort, AddModelInput, LifecyclePort
 ├─ src/core/application/endpoint-service.ts   EndpointService
 ├─ src/adapters/driven/runpod/   types.ts, http.ts (RunpodHttp, RunpodError), compute-provider.ts (RunpodComputeProvider), pools.ts (POOLS), price-catalog.ts (RunpodPriceCatalog)
 ├─ src/adapters/driven/vllm/     presets.ts (FAMILIES, inferFamily, parsersFor), recipe.ts (VllmWorkerRecipe, diskGb)
 ├─ src/adapters/driven/huggingface/weights-info.ts   fetchWeightsGb, HfWeightsInfo
-├─ src/adapters/driven/opencode/ state-store.ts (OpencodeStateStore), notifier.ts (RpcNotifier), confirmation.ts (ConfirmBroker, RpcConfirmation)
+├─ src/adapters/driven/opencode/ state-store.ts (OpencodeStateStore), notifier.ts (RpcNotifier), confirmation.ts (ConfirmBroker, RpcConfirmation), catalog-publisher.ts (OpencodeCatalogPublisher)
 ├─ src/adapters/driven/system/   clock.ts (SystemClock), logger.ts (ConsoleLogger)
 ├─ src/adapters/driving/rpc/     contract.ts (zod DTOs + RunpodRpc), format.ts
-├─ src/adapters/driving/opencode/ config.ts (resolveSettings), provider-catalog.ts, commands.ts, plugin.ts
-├─ src/adapters/driving/tui/     toasts.ts, plugin.tsx
-└─ test/  architecture.test.ts, fakes/{clock,store,compute,catalog,weights,recipe,confirmation,notifier,logger,fixtures}.ts, *.test.ts
+├─ src/adapters/driving/opencode/ config.ts (resolveSettings, parseOverrides), provider-catalog.ts, commands.ts, plugin.ts
+├─ src/adapters/driving/tui/     choose.ts (provision dialog loop), toasts.ts, dashboard.ts (sidebar serverless dashboard), plugin.tsx
+└─ test/  architecture.test.ts, fakes/{clock,store,compute,catalog,weights,recipe,confirmation,notifier,logger,publisher,fixtures}.ts, *.test.ts
 ```
 
 ---
@@ -2326,10 +2328,12 @@ git commit -m "test(core): characterize warm-up retries, timeouts, diagnostics a
 ### Task 5: Lifecycle and runtime operations — `start`, `stop`, `down`, `status`, `add`, `set`, `remove`, `models`, variants
 
 **Files:**
+- Modify: `src/core/domain/events.ts` (add `WorkerCounts`, `ModelStatus.workers`)
 - Modify: `src/core/application/endpoint-service.ts`
 - Test: `test/service-lifecycle.test.ts`, `test/service-runtime-config.test.ts`
 
 **Interfaces:**
+- Produces (`events.ts`): `interface WorkerCounts { initializing; running; idle; throttled }`; `ModelStatus.workers: WorkerCounts | null` (live counts from a best-effort health call; null when not provisioned or the call fails).
 - Produces: `EndpointService implements ModelRoutingPort, OperationsPort, LifecyclePort` — `start()` (load persisted overrides + runtime models, reconcile remote endpoints, publish), `stop(budgetMs = 10000)`, `status()`, `up(modelID)`, `down(modelID?)`, `add(input)`, `set(modelID, overrides)`, `remove(modelID)`, `models()`; `ensureReady(modelID, { gpu })` applies a differing pool as an override before provisioning.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2338,6 +2342,7 @@ git commit -m "test(core): characterize warm-up retries, timeouts, diagnostics a
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { BILLING_TTL_MS } from "../src/core/application/endpoint-service.ts"
 import { specHashFor, type EndpointRecord } from "../src/core/domain/endpoint.ts"
 import { flush } from "./fakes/clock.ts"
 import { harness, sampleModel } from "./fakes/fixtures.ts"
@@ -2455,7 +2460,7 @@ test("stop deletes owned endpoints only when deleteOnExit is set (default off)",
   assert.equal(off.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
 })
 
-test("status reports phase, endpoint, rate, spend, billed and orphans; up() skips confirmation", async () => {
+test("status reports phase, endpoint, rate, spend, billed, live workers and orphans; up() skips confirmation", async () => {
   const h = harness()
   h.compute.billed = 0.77
   const before = await h.service.status()
@@ -2465,12 +2470,14 @@ test("status reports phase, endpoint, rate, spend, billed and orphans; up() skip
   assert.equal(before.models[0]!.ratePerHour, 1.22)
   assert.equal(before.models[0]!.gpuLabel, "A6000/A40 48GB")
   assert.equal(before.models[0]!.billedUsd, null)
+  assert.equal(before.models[0]!.workers, null)
   const p = h.service.up("m")
   await flush()
   assert.equal(h.confirmation.asked.length, 0)
   h.compute.finishWarmup()
   await p
   await h.clock.advance(60_000)
+  h.compute.healthSnapshot = { initializing: 0, running: 1, idle: 0, throttled: 0 }
   const after = await h.service.status()
   const m = after.models[0]!
   assert.equal(m.phase, "ready")
@@ -2479,6 +2486,15 @@ test("status reports phase, endpoint, rate, spend, billed and orphans; up() skip
   assert.ok(m.spendUsd > 0)
   assert.equal(m.lastRequestAt, 0)
   assert.equal(m.gpuCount, 1)
+  assert.deepEqual(m.workers, { initializing: 0, running: 1, idle: 0, throttled: 0 })
+  // billed $ is cached for BILLING_TTL_MS; live worker counts are only fetched while warming/ready
+  h.compute.billed = 1.5
+  assert.equal((await h.service.status()).models[0]!.billedUsd, 0.77)
+  await h.clock.advance(BILLING_TTL_MS)
+  const later = (await h.service.status()).models[0]!
+  assert.equal(later.phase, "idle")
+  assert.equal(later.billedUsd, 1.5)
+  assert.equal(later.workers, null)
 })
 ```
 
@@ -2623,12 +2639,31 @@ test("a variant pool passed to ensureReady is applied as an override before prov
 Run: `npm test`
 Expected: FAIL — `start`, `down`, `stop`, `status`, `up`, `add`, `set`, `remove`, `models` are not functions.
 
-- [ ] **Step 3: Add the lifecycle and runtime-config methods to `EndpointService`**
+- [ ] **Step 3: Add `WorkerCounts` to `src/core/domain/events.ts`**
+
+Insert before `ModelStatus` and add the field at the end of `ModelStatus`:
+```ts
+/** Live worker counts of a provisioned endpoint (running workers are the ones being billed). */
+export interface WorkerCounts {
+  initializing: number
+  running: number
+  idle: number
+  throttled: number
+}
+```
+```ts
+  lastRequestAt: number | null
+  /** From a best-effort health call; null when not provisioned or the call failed. */
+  workers: WorkerCounts | null
+}
+```
+
+- [ ] **Step 4: Add the lifecycle and runtime-config methods to `EndpointService`**
 
 Change the imports and the class declaration:
 ```ts
 import { buildEndpointSpec, modelIDFromName, specHashFor, type EndpointRecord, type Phase } from "../domain/endpoint.ts"
-import type { ModelStatus, StateEvent, StatusReport } from "../domain/events.ts"
+import type { ModelStatus, StateEvent, StatusReport, WorkerCounts } from "../domain/events.ts"
 import { applyOverrides, deriveModelID, findModel, idleTimeoutFor, type ModelConfig, type ModelOverrides, type Settings } from "../domain/model.ts"
 import { buildProposal, gpuVariantsFor, type PoolPricing, type ProvisionOverrides } from "../domain/provision.ts"
 import { DEFAULT_WEIGHTS_GB, buildQuote, fitsPool, type PoolRate, type Quote } from "../domain/quote.ts"
@@ -2787,7 +2822,12 @@ Add these methods after `ensureReady`:
     for (const st of this.states.values()) {
       st.rate = await this.rateFor(st.model)
       let billedUsd: number | null = null
-      if (st.record && this.ports.compute) billedUsd = await this.ports.compute.billedUsd(st.record.endpointID).catch(() => null)
+      let workers: WorkerCounts | null = null
+      if (st.record && this.ports.compute) {
+        billedUsd = await this.billedFor(st.record.endpointID)
+        // Live counts only matter (and only cost an API call) while a worker may be running.
+        if (st.phase === "warming" || st.phase === "ready") workers = await this.ports.compute.health(st.record.endpointID).catch(() => null)
+      }
       models.push({
         modelID: st.model.id,
         phase: st.phase,
@@ -2800,6 +2840,7 @@ Add these methods after `ensureReady`:
         gpuCount: st.model.gpuCount,
         billedUsd,
         lastRequestAt: st.lastRequestAt,
+        workers,
       })
     }
     return { models, orphans: [...this.orphans] }
@@ -2890,18 +2931,37 @@ Add these methods after `ensureReady`:
   private expectedHash(model: ModelConfig): string {
     return specHashFor(model, this.settings, this.ports.recipe.recipe(model, this.settings, null))
   }
+
+  /** Billing data changes slowly and the dashboard polls status(); cache it per endpoint. */
+  private async billedFor(endpointID: string): Promise<number | null> {
+    const now = this.ports.clock.now()
+    const cached = this.billedCache.get(endpointID)
+    if (cached && now - cached.at < BILLING_TTL_MS) return cached.usd
+    const usd = await this.compute().billedUsd(endpointID).catch(() => null)
+    this.billedCache.set(endpointID, { at: now, usd })
+    return usd
+  }
 ```
 
-- [ ] **Step 4: Run tests and typecheck**
+Add the constant next to the other exported constants and the cache field next to `orphans`:
+```ts
+/** How long a billed-$ lookup is reused by status(). */
+export const BILLING_TTL_MS = 5 * 60_000
+```
+```ts
+  private readonly billedCache = new Map<string, { at: number; usd: number | null }>()
+```
+
+- [ ] **Step 5: Run tests and typecheck**
 
 Run: `npm run check`
 Expected: pass. (`expectedHash` matches the test helper because both call the recipe with `weightsGb = null` and the hash excludes disk. In the "variant" test the first `warm` on AMPERE_80 asks once because `set` happens before `run`.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/core/application/endpoint-service.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts
-git commit -m "feat(core): reconcile on start, teardown, status and runtime model configuration (add/set/remove, variants)"
+git add src/core/domain/events.ts src/core/application/endpoint-service.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts
+git commit -m "feat(core): reconcile on start, teardown, status with live workers, and runtime model configuration (add/set/remove, variants)"
 ```
 
 ---
@@ -4092,7 +4152,7 @@ git commit -m "feat(huggingface): weights size adapter"
 - Test: `test/rpc-contract.test.ts`, `test/format.test.ts`
 
 **Interfaces:**
-- Consumes: domain types `Quote`, `StateEvent`, `ModelStatus`, `StatusReport`, `Phase`, `NoticeLevel`, `GpuOption`, `ProvisionProposal`, `ProvisionOverrides`.
+- Consumes: domain types `Quote`, `StateEvent`, `ModelStatus` (incl. `workers: WorkerCounts | null`), `StatusReport`, `Phase`, `NoticeLevel`, `GpuOption`, `ProvisionProposal`, `ProvisionOverrides`.
 - Produces (`contract.ts`): `PhaseSchema`, `QuoteSchema: z.ZodType<Quote>`, `GpuOptionSchema: z.ZodType<GpuOption>`, `ProvisionProposalSchema: z.ZodType<ProvisionProposal>`, `ProvisionOverridesSchema: z.ZodType<ProvisionOverrides>`, `StateEventSchema: z.ZodType<StateEvent>`, `ModelStatusSchema: z.ZodType<ModelStatus>`, `StatusReportSchema: z.ZodType<StatusReport>`, `NoticeSchema`, `RunpodRpc` (`id: "runpod"`, methods `status/up/down/confirm`, events `confirm.requested/state/notice`).
 - Produces (`format.ts`): `formatUsd`, `formatDuration`, `formatQuote`, `formatGpuOption(option)`, `formatIdleChoice(seconds, ratePerHour)`, `phaseLabel`, `footerLabel`, `formatStatus`, `formatModel(config)`.
 
@@ -4182,13 +4242,13 @@ test("phaseLabel and footerLabel", () => {
 test("formatStatus prints one line per model plus orphans; formatModel prints the effective config", () => {
   const status: StatusReport = {
     models: [
-      { modelID: "m", phase: "ready", detail: "ready in 142s", spendUsd: 0.42, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: 0.5, lastRequestAt: 1 },
-      { modelID: "n", phase: "cold", detail: null, spendUsd: 0, ratePerHour: 2.72, gpu: "AMPERE_80", gpuLabel: "A100 80GB", endpointID: null, gpuCount: 2, billedUsd: null, lastRequestAt: null },
+      { modelID: "m", phase: "ready", detail: "ready in 142s", spendUsd: 0.42, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: 0.5, lastRequestAt: 1, workers: { initializing: 1, running: 1, idle: 0, throttled: 0 } },
+      { modelID: "n", phase: "cold", detail: null, spendUsd: 0, ratePerHour: 2.72, gpu: "AMPERE_80", gpuLabel: "A100 80GB", endpointID: null, gpuCount: 2, billedUsd: null, lastRequestAt: null, workers: null },
     ],
     orphans: [{ id: "epX", name: "oc-runpod-old" }],
   }
   const lines = formatStatus(status).split("\n")
-  assert.equal(lines[0], "m: ready [ep1] · A6000/A40 48GB $1.22/h · session ≈$0.42 · billed $0.50 · ready in 142s")
+  assert.equal(lines[0], "m: ready [ep1] · A6000/A40 48GB $1.22/h · session ≈$0.42 · billed $0.50 · workers 1 running / 0 idle / 1 starting · ready in 142s")
   assert.equal(lines[1], "n: cold · A100 80GB ×2 $2.72/h · session ≈$0.00")
   assert.equal(lines[2], "Unmanaged oc-runpod-* endpoints: oc-runpod-old [epX]")
   assert.equal(formatStatus({ models: [], orphans: [] }), "RunPod: no models configured (options.models or /runpod-add)")
@@ -4275,6 +4335,7 @@ export const ModelStatusSchema: z.ZodType<ModelStatus> = z.object({
   gpuCount: z.number().int(),
   billedUsd: z.number().nullable(),
   lastRequestAt: z.number().nullable(),
+  workers: z.object({ initializing: z.number(), running: z.number(), idle: z.number(), throttled: z.number() }).nullable(),
 })
 
 export const StatusReportSchema: z.ZodType<StatusReport> = z.object({
@@ -4383,6 +4444,7 @@ export function formatStatus(s: StatusReport): string {
       `session ≈${formatUsd(m.spendUsd)}`,
     ]
     if (m.billedUsd !== null) parts.push(`billed ${formatUsd(m.billedUsd)}`)
+    if (m.workers) parts.push(`workers ${m.workers.running} running / ${m.workers.idle} idle${m.workers.initializing > 0 ? ` / ${m.workers.initializing} starting` : ""}`)
     if (m.detail) parts.push(m.detail)
     return parts.join(" · ")
   })
@@ -5220,7 +5282,7 @@ function host() {
   return { h, defs }
 }
 
-const report: StatusReport = { models: [{ modelID: "m", phase: "ready", detail: null, spendUsd: 0.1, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: null, lastRequestAt: 0 }], orphans: [] }
+const report: StatusReport = { models: [{ modelID: "m", phase: "ready", detail: null, spendUsd: 0.1, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: null, lastRequestAt: 0, workers: null }], orphans: [] }
 
 function ops(overrides: Partial<OperationsPort> = {}): OperationsPort & { calls: string[] } {
   const calls: string[] = []
@@ -5653,16 +5715,16 @@ git commit -m "feat(opencode): composition root wiring EndpointService, provider
 
 ---
 
-### Task 15: TUI adapter — provision dialog loop, toasts, footer status
+### Task 15: TUI adapter — provision dialog loop, toasts, footer status, serverless dashboard
 
 **Files:**
-- Create: `src/adapters/driving/tui/choose.ts`, `src/adapters/driving/tui/toasts.ts`
+- Create: `src/adapters/driving/tui/choose.ts`, `src/adapters/driving/tui/toasts.ts`, `src/adapters/driving/tui/dashboard.ts`
 - Modify: `src/adapters/driving/tui/plugin.tsx` (replace the stub)
-- Test: `test/choose.test.ts`, `test/toasts.test.ts`
+- Test: `test/choose.test.ts`, `test/toasts.test.ts`, `test/dashboard.test.ts`
 
 **Interfaces:**
-- Consumes: `RunpodRpc`, `formatQuote`, `formatGpuOption`, `formatIdleChoice`, `footerLabel`, `formatDuration`, `formatUsd`, `idleWindowUsd`, `StateEvent`, `ModelStatus`, `ProvisionProposal`, `ProvisionDecision`.
-- Produces: `interface SelectOption<V> { title; value; description? }`, `interface DialogLike { select<V>(options: { title; placeholder?; current?: V; options: readonly SelectOption<V>[] }): Promise<V | undefined> }`, `chooseProvision(dialog: DialogLike, proposal: ProvisionProposal): Promise<ProvisionDecision>`; `interface ToastDecision { message; variant }`, `toastFor(prev: StateEvent | undefined, next: StateEvent): ToastDecision | null`.
+- Consumes: `RunpodRpc`, `formatQuote`, `formatGpuOption`, `formatIdleChoice`, `footerLabel`, `phaseLabel`, `formatDuration`, `formatUsd`, `idleWindowUsd`, `StateEvent`, `ModelStatus`, `StatusReport`, `ProvisionProposal`, `ProvisionDecision`.
+- Produces: `interface SelectOption<V> { title; value; description? }`, `interface DialogLike { select<V>(options: { title; placeholder?; current?: V; options: readonly SelectOption<V>[] }): Promise<V | undefined> }`, `chooseProvision(dialog: DialogLike, proposal: ProvisionProposal): Promise<ProvisionDecision>`; `interface ToastDecision { message; variant }`, `toastFor(prev: StateEvent | undefined, next: StateEvent): ToastDecision | null`; `interface DashboardRow { modelID; phase; gpu; rate; spend; workers }`, `interface DashboardView { title; rows; totals; lines: string[] }`, `dashboardView(report: StatusReport | null, live: Record<string, StateEvent>): DashboardView`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5770,10 +5832,69 @@ test("warming progress toasts every 30 seconds only", () => {
 })
 ```
 
+`test/dashboard.test.ts`:
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { dashboardView } from "../src/adapters/driving/tui/dashboard.ts"
+import type { StateEvent, StatusReport } from "../src/core/domain/events.ts"
+
+const report: StatusReport = {
+  models: [
+    { modelID: "n", phase: "cold", detail: null, spendUsd: 0, ratePerHour: 2.72, gpu: "AMPERE_80", gpuLabel: "A100 80GB", endpointID: null, gpuCount: 1, billedUsd: null, lastRequestAt: null, workers: null },
+    { modelID: "m", phase: "ready", detail: null, spendUsd: 0.42, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: 0.5, lastRequestAt: 1, workers: { initializing: 0, running: 1, idle: 0, throttled: 0 } },
+  ],
+  orphans: [{ id: "x", name: "oc-runpod-x" }],
+}
+const live: Record<string, StateEvent> = {
+  n: { modelID: "n", phase: "warming", detail: "starting worker", elapsedSec: 30, spendUsd: 0.01, ratePerHour: 2.72, gpu: "AMPERE_80", gpuLabel: "A100 80GB" },
+}
+
+test("dashboardView merges newer live phases into the report, sorts billing models first and totals the spend", () => {
+  const view = dashboardView(report, live)
+  assert.deepEqual(view.rows.map((r) => r.modelID), ["m", "n"])
+  assert.deepEqual(view.rows[0], { modelID: "m", phase: "warm", gpu: "A6000/A40 48GB", rate: "$1.22/h", spend: "≈$0.42 ($0.50 billed)", workers: "1/0 wk" })
+  assert.equal(view.rows[1]!.phase, "warming 30s")
+  assert.equal(view.rows[1]!.spend, "≈$0.01")
+  assert.equal(view.rows[1]!.workers, "")
+  assert.equal(view.totals, "billing 2 · $3.94/h now · ≈$0.43 session · orphans 1")
+  assert.deepEqual(view.lines, [
+    "RunPod serverless",
+    "m · warm · A6000/A40 48GB",
+    "  $1.22/h · ≈$0.42 ($0.50 billed) · 1/0 wk",
+    "n · warming 30s · A100 80GB",
+    "  $2.72/h · ≈$0.01",
+    "billing 2 · $3.94/h now · ≈$0.43 session · orphans 1",
+  ])
+})
+
+test("a live event with the same phase as the report does not freeze the spend (report wins, live elapsed kept)", () => {
+  const stale: StateEvent = { modelID: "m", phase: "ready", detail: "ready in 142s", elapsedSec: 142, spendUsd: 0.1, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB" }
+  const view = dashboardView({ models: [report.models[1]!], orphans: [] }, { m: stale })
+  assert.equal(view.rows[0]!.spend, "≈$0.42 ($0.50 billed)")
+  assert.equal(view.rows[0]!.phase, "warm")
+  const warming = dashboardView({ models: [{ ...report.models[1]!, phase: "warming", workers: null }], orphans: [] }, { m: { ...stale, phase: "warming", elapsedSec: 57 } })
+  assert.equal(warming.rows[0]!.phase, "warming 57s")
+  assert.equal(warming.rows[0]!.spend, "≈$0.42 ($0.50 billed)")
+})
+
+test("dashboardView without a report or models shows a placeholder line", () => {
+  assert.deepEqual(dashboardView(null, {}).lines, ["RunPod serverless", "no models configured"])
+  const empty = dashboardView({ models: [], orphans: [] }, {})
+  assert.deepEqual(empty.rows, [])
+  assert.equal(empty.totals, "billing 0 · $0.00/h now · ≈$0.00 session")
+})
+
+test("a model starting up shows the initializing count", () => {
+  const view = dashboardView({ models: [{ ...report.models[1]!, workers: { initializing: 1, running: 0, idle: 0, throttled: 0 } }], orphans: [] }, {})
+  assert.equal(view.rows[0]!.workers, "0/0 wk +1 starting")
+})
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `npm test`
-Expected: FAIL — cannot find `choose.ts` / `toasts.ts`.
+Expected: FAIL — cannot find `choose.ts` / `toasts.ts` / `dashboard.ts`.
 
 - [ ] **Step 3: Implement `src/adapters/driving/tui/choose.ts`**
 
@@ -5891,37 +6012,137 @@ export function toastFor(prev: StateEvent | undefined, next: StateEvent): ToastD
 }
 ```
 
+- [ ] **Step 4b: Implement `src/adapters/driving/tui/dashboard.ts`**
+
+```ts
+import type { ModelStatus, StateEvent, StatusReport } from "../../../core/domain/events.ts"
+import { formatUsd, phaseLabel } from "../rpc/format.ts"
+
+export interface DashboardRow {
+  modelID: string
+  phase: string
+  gpu: string
+  rate: string
+  spend: string
+  workers: string
+}
+
+export interface DashboardView {
+  title: string
+  rows: DashboardRow[]
+  totals: string
+  /** Title, two lines per model, totals (or a placeholder) — one `<text>` each; sized for the narrow sidebar. */
+  lines: string[]
+}
+
+const TITLE = "RunPod serverless"
+/** Phases during which a worker is (or is about to be) billed. */
+const BILLING_PHASES = new Set(["creating", "warming", "ready"])
+const ORDER: Record<string, number> = { ready: 0, warming: 1, creating: 2, confirming: 3, deleting: 4, error: 5, idle: 6, cold: 7 }
+
+/**
+ * Merges the last status report with live state events and lays out the sidebar dashboard.
+ * A live event only overrides the report when its phase differs (it is newer); otherwise the report's
+ * numbers win so spend keeps moving while a model sits in `ready` (no events are emitted then).
+ */
+export function dashboardView(report: StatusReport | null, live: Record<string, StateEvent>): DashboardView {
+  const models: ModelStatus[] = (report?.models ?? []).map((m) => {
+    const e = live[m.modelID]
+    return e && e.phase !== m.phase ? { ...m, phase: e.phase, detail: e.detail, spendUsd: e.spendUsd, ratePerHour: e.ratePerHour, gpu: e.gpu, gpuLabel: e.gpuLabel } : m
+  })
+  const sorted = [...models].sort((a, b) => (ORDER[a.phase] ?? 9) - (ORDER[b.phase] ?? 9) || (a.modelID < b.modelID ? -1 : a.modelID > b.modelID ? 1 : 0))
+  const rows: DashboardRow[] = sorted.map((m) => ({
+    modelID: m.modelID,
+    phase: phaseLabel({ phase: m.phase, elapsedSec: live[m.modelID]?.elapsedSec ?? null }),
+    gpu: m.gpuLabel,
+    rate: `${formatUsd(m.ratePerHour)}/h`,
+    spend: `≈${formatUsd(m.spendUsd)}${m.billedUsd !== null ? ` (${formatUsd(m.billedUsd)} billed)` : ""}`,
+    workers: m.workers ? `${m.workers.running}/${m.workers.idle} wk${m.workers.initializing > 0 ? ` +${m.workers.initializing} starting` : ""}` : "",
+  }))
+  const billing = sorted.filter((m) => BILLING_PHASES.has(m.phase))
+  const billingRate = billing.reduce((sum, m) => sum + m.ratePerHour, 0)
+  const spend = models.reduce((sum, m) => sum + m.spendUsd, 0)
+  const orphans = report?.orphans.length ?? 0
+  const totals = `billing ${billing.length} · ${formatUsd(billingRate)}/h now · ≈${formatUsd(spend)} session${orphans > 0 ? ` · orphans ${orphans}` : ""}`
+  const lines = [
+    TITLE,
+    ...rows.flatMap((r) => [`${r.modelID} · ${r.phase} · ${r.gpu}`, `  ${[r.rate, r.spend, r.workers].filter((s) => s.length > 0).join(" · ")}`]),
+    rows.length === 0 ? "no models configured" : totals,
+  ]
+  return { title: TITLE, rows, totals, lines }
+}
+```
+
 - [ ] **Step 5: Run tests**
 
 Run: `npm test`
-Expected: choose and toast tests pass.
+Expected: choose, toast and dashboard tests pass.
 
 - [ ] **Step 6: Replace `src/adapters/driving/tui/plugin.tsx`**
 
 ```tsx
 import { Plugin } from "@opencode/plugin/tui"
-import { Show } from "solid-js"
-import type { ModelStatus, StateEvent } from "../../../core/domain/events.ts"
+import { For, Show } from "solid-js"
+import type { ModelStatus, StateEvent, StatusReport } from "../../../core/domain/events.ts"
 import { RunpodRpc } from "../rpc/contract.ts"
 import { footerLabel } from "../rpc/format.ts"
 import { chooseProvision } from "./choose.ts"
+import { dashboardView } from "./dashboard.ts"
 import { toastFor } from "./toasts.ts"
 
 interface TuiState {
   active: StateEvent | null
   last: Record<string, StateEvent>
+  report: StatusReport | null
 }
 
 function fromStatus(m: ModelStatus): StateEvent {
   return { modelID: m.modelID, phase: m.phase, detail: m.detail, elapsedSec: null, spendUsd: m.spendUsd, ratePerHour: m.ratePerHour, gpu: m.gpu, gpuLabel: m.gpuLabel }
 }
 
-/** UI adapter: provisioning dialog, toasts and a footer status line, all fed by the server plugin's RPC events. */
+/** UI adapter: provisioning dialog, toasts, footer status line and sidebar dashboard, all fed by the server plugin's RPC. */
 export default Plugin.define({
   id: "runpod.tui",
   async setup(context) {
     const rpc = context.client.rpc(RunpodRpc)
-    const [state, update] = context.storage.memory<TuiState>("runpod", { initial: { active: null, last: {} } })
+    const [state, update] = context.storage.memory<TuiState>("runpod", { initial: { active: null, last: {}, report: null } })
+
+    /** Pulls a fresh status report. Where the report's phase equals the last live event's phase the report is newer
+     *  (spend keeps accruing while `ready` without events), so it replaces the event — keeping the live elapsed time. */
+    const refresh = () =>
+      rpc
+        .status({})
+        .then((report) => {
+          update((draft) => {
+            draft.report = report
+            for (const m of report.models) {
+              const prev = draft.last[m.modelID]
+              if (prev && prev.phase === m.phase) draft.last[m.modelID] = { ...fromStatus(m), elapsedSec: prev.elapsedSec }
+            }
+            if (draft.active) {
+              const latest = draft.last[draft.active.modelID]
+              if (latest) draft.active = { ...latest }
+            } else {
+              const known = report.models.find((m) => m.endpointID !== null) ?? report.models.find((m) => m.phase !== "cold")
+              if (known) {
+                const snapshot = fromStatus(known)
+                draft.last[known.modelID] = snapshot
+                draft.active = snapshot
+              }
+            }
+          })
+        })
+        .catch(() => {
+          // server plugin not registered (yet); live events will populate the views later
+        })
+    let debounce: ReturnType<typeof setTimeout> | null = null
+    const scheduleRefresh = () => {
+      if (debounce !== null) clearTimeout(debounce)
+      debounce = setTimeout(() => {
+        debounce = null
+        void refresh()
+      }, 1000)
+    }
 
     const offConfirm = rpc.events.on("confirm.requested", async (event) => {
       const { requestID, proposal } = event.data
@@ -5931,12 +6152,15 @@ export default Plugin.define({
 
     const offState = rpc.events.on("state", (event) => {
       const next = event.data
-      const toast = toastFor(state.last[next.modelID], next)
+      const prev = state.last[next.modelID]
+      const toast = toastFor(prev, next)
       update((draft) => {
         draft.last[next.modelID] = next
         draft.active = next
       })
       if (toast) context.ui.toast.show({ title: "RunPod", ...toast })
+      // Only phase transitions warrant a status() round-trip; warming progress events arrive every ~3 s.
+      if (prev?.phase !== next.phase) scheduleRefresh()
     })
 
     const offNotice = rpc.events.on("notice", (event) => {
@@ -5949,20 +6173,17 @@ export default Plugin.define({
     const unslotPrompt = context.ui.slot({ append: "prompt.footer.status", render: footer })
     const unslotHome = context.ui.slot({ append: "home.footer.status", render: footer })
 
-    rpc
-      .status({})
-      .then((report) => {
-        const known = report.models.find((m) => m.endpointID !== null) ?? report.models.find((m) => m.phase !== "cold")
-        if (!known) return
-        update((draft) => {
-          const snapshot = fromStatus(known)
-          draft.last[known.modelID] = snapshot
-          draft.active = snapshot
-        })
-      })
-      .catch(() => {
-        // server plugin not registered (yet); live events will populate the footer later
-      })
+    /** Sidebar dashboard next to opencode's context info: status report + live events; refreshed on phase changes and every 30 s. */
+    const interval = setInterval(() => void refresh(), 30_000)
+    const unslotSidebar = context.ui.slot({
+      append: "sidebar.content",
+      render: () => (
+        <box>
+          <For each={dashboardView(state.report, state.last).lines}>{(line) => <text fg={context.theme.text.muted}>{line}</text>}</For>
+        </box>
+      ),
+    })
+    void refresh()
 
     return () => {
       offConfirm()
@@ -5970,6 +6191,9 @@ export default Plugin.define({
       offNotice()
       unslotPrompt()
       unslotHome()
+      unslotSidebar()
+      clearInterval(interval)
+      if (debounce !== null) clearTimeout(debounce)
     }
   },
 })
@@ -5989,7 +6213,7 @@ cd /Volumes/dev/projects/runpod-opencode/.claude/worktrees/feat-runpod-plugin &&
 ```
 1. `/models` → pick `runpod/qwen3-0.6b`; send `Reply with one word.`
 2. Expected: select dialog "RunPod: provision qwen3-0.6b?" with *Provision on A4000/A4500 16GB — $0.58/h* (description = quote), *Change GPU…*, *Change idle timeout (60s)…*, *Cancel*. Open *Change GPU…* (every pool priced, fits flags), go back, choose *Provision*.
-3. Expected toasts: "Provisioning qwen3-0.6b on A4000/A4500 16GB · $0.58/h", "Cold start of qwen3-0.6b…", progress every 30 s, then "qwen3-0.6b ready in …"; the answer streams in; footer shows `runpod A4000/A4500 16GB · warm · $0.58/h · ≈$0.0x`.
+3. Expected toasts: "Provisioning qwen3-0.6b on A4000/A4500 16GB · $0.58/h", "Cold start of qwen3-0.6b…", progress every 30 s, then "qwen3-0.6b ready in …"; the answer streams in; footer shows `runpod A4000/A4500 16GB · warm · $0.58/h · ≈$0.0x`. The sidebar shows the `RunPod serverless` block under opencode's context/usage section (toggle the sidebar if hidden): `qwen3-0.6b · warm · A4000/A4500 16GB`, then `  $0.58/h · ≈$… · 1/0 wk` once health reports a running worker, and the `billing 1 · $0.58/h now · ≈$… session` totals line. It updates about 1 s after each phase change and every 30 s; the spend on the second line keeps increasing while the model stays warm. If the block does not render in the sidebar, note what "context view" should mean for the user (fallback: a `session.panel` contribution) and continue.
 4. `/runpod-status` → one line with `[<endpointID>]`, session ≈$, and (after a minute) billed $.
 5. Wait ~75 s idle → toast "qwen3-0.6b scaled to zero · ≈$… this session", footer says `cold`.
 6. Send another message → "Cold start of qwen3-0.6b…" without a dialog → answer.
@@ -6001,8 +6225,8 @@ cd /Volumes/dev/projects/runpod-opencode/.claude/worktrees/feat-runpod-plugin &&
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/adapters/driving/tui test/choose.test.ts test/toasts.test.ts
-git commit -m "feat(tui): provisioning dialog with GPU/idle choices, state toasts and footer status"
+git add src/adapters/driving/tui test/choose.test.ts test/toasts.test.ts test/dashboard.test.ts
+git commit -m "feat(tui): provisioning dialog with GPU/idle choices, state toasts, footer status and sidebar dashboard"
 ```
 
 ---
@@ -6165,7 +6389,8 @@ created lazily on first use, scaled to zero when idle, and configurable at runti
 - The endpoint uses `workers.min = 0`: after the idle timeout RunPod stops the worker and billing stops. The next
   request re-warms it (no dialog).
 - Toasts show provisioning, cold-start progress, readiness, scale-down and deletion with the running spend; the
-  footer shows `runpod <gpu> · warm|cold · $/h · ≈$spent`.
+  footer shows `runpod <gpu> · warm|cold · $/h · ≈$spent`; the sidebar has a **RunPod serverless** dashboard (one row
+  per model: phase, GPU, $/h, session ≈$ and billed $, live running/idle workers; totals line with the $/h billing now).
 - Endpoints are **kept** between sessions by default (zero workers cost $0) and re-adopted at start; set
   `deleteOnExit: true` to delete them when opencode shuts down. Stale endpoints of a configured model (config
   changed) are replaced automatically; endpoints of models no longer configured are only reported.

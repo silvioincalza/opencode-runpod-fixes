@@ -259,7 +259,7 @@ Errors thrown here surface in the session as the request error. No changes to he
 Replies are posted with `ctx.session.synthetic` if verified not to trigger a model turn (§9); otherwise via RPC `notice` event (TUI toast) only.
 
 ### 5.6 RPC contract (`adapters/driving/rpc/contract.ts`, zod DTOs typed against the domain types)
-- methods: `status() → StatusReport`, `up({modelID})`, `down({modelID?})`, `confirm({requestID, accepted, overrides?: {gpu?, idleTimeout?}})`.
+- methods: `status() → StatusReport` (per model: phase, endpointID, gpu, gpuLabel, gpuCount, ratePerHour, spendUsd, billedUsd, lastRequestAt, detail, and `workers: { initializing, running, idle, throttled } | null` from a best-effort health call), `up({modelID})`, `down({modelID?})`, `confirm({requestID, accepted, overrides?: {gpu?, idleTimeout?}})`.
 - events: `confirm.requested {requestID, proposal: {quote, gpuOptions:[{pool, label, ratePerHour, rateSource, vramGb, fits, estColdStartSec, current}], idleTimeoutChoices}}`,
   `state {modelID, phase, detail, elapsedSec, spendUsd, ratePerHour, gpu, gpuLabel}`, `notice {level, message}`.
 
@@ -287,6 +287,13 @@ merged with persisted `ModelOverrides` (`overrides/<id>` in plugin storage) or, 
   Multiple TUIs: first reply wins; server ignores later ones.
 - `events.on("state")` → `ui.toast.show` on phase transitions: creating ("Provisioning A6000 48GB · $1.22/h"), warming progress every 30 s
   ("Cold start 90s · initializing 1"), ready ("Ready in 142s"), idle ("Scaled to zero · ≈$0.11 this session"), deleted ("Deleted · ≈$0.31"), errors.
+- **Serverless dashboard** (added 2026-09-26): `ui.slot({ append: "sidebar.content", render })` — a block in the TUI sidebar next to opencode's
+  context/usage info titled `RunPod serverless`, two lines per model sized for the narrow sidebar (`<id> · <phase> · <gpu>` then
+  `  $/h · ≈$spend[ ($billed billed)] · <running>/<idle> wk`), billing models first, and a totals line
+  (`billing N · $X/h now · ≈$Y session[ · orphans K]`); one `<text>` per line inside a `<box>`. Data = the last `status()` report merged with
+  the latest `state` event per model; a live event only overrides the report when its phase differs (otherwise spend would freeze while a
+  model sits in `ready`, which emits no events). Refreshed about 1 s after each phase transition and every 30 s. To bound API calls,
+  `status()` fetches live worker counts only for `warming`/`ready` models and caches billed $ per endpoint for 5 minutes.
 - Footer: `ui.slot({ append: "prompt.footer.status", render })` showing the active runpod model only:
   `runpod: <gpu> <warm|cold|warming 87s> · $<rate>/h · ≈$<spend>`; hidden when no runpod model has been used this run.
   State lives in `context.storage.memory("runpod", { initial })` updated from `state` events; on TUI start it calls `rpc.status()` once.
@@ -305,7 +312,7 @@ merged with persisted `ModelOverrides` (`overrides/<id>` in plugin storage) or, 
 | Two plugin instances (global + project config) | both adopt by name; last one out deletes; documented caveat |
 
 ## 8. Testing
-- Unit (`node --test`, TS): domain (specHash, quote math, SpendMeter, events); `EndpointService` against fakes for every port (confirm accept/decline/timeout, blocked quotes, in-flight dedupe, warm-up retry/timeout/diagnostics, idle re-warm, reconcile adopt/stale/orphan, teardown order, status); each driven adapter against a fake `fetch` (RunPod HTTP mapping, RFC 9457 errors, retries, pagination; vLLM recipe env/parsers/disk; HF sizes); driving adapters (config resolution incl. secret placeholders and `key=value` override parsing, provider/model builders incl. variants, command parsing/replies for status/up/down/add/set/remove, RPC DTO round-trips, toast decisions, the `chooseProvision` dialog loop against a scripted dialog); runtime config in the service (overrides persisted, hash-changing edits tear down, idle-only edits patch, `add` picks the cheapest fitting pool, `remove` vs reset, variants published); `architecture.test.ts` enforcing the dependency rule.
+- Unit (`node --test`, TS): domain (specHash, quote math, SpendMeter, events); `EndpointService` against fakes for every port (confirm accept/decline/timeout, blocked quotes, in-flight dedupe, warm-up retry/timeout/diagnostics, idle re-warm, reconcile adopt/stale/orphan, teardown order, status); each driven adapter against a fake `fetch` (RunPod HTTP mapping, RFC 9457 errors, retries, pagination; vLLM recipe env/parsers/disk; HF sizes); driving adapters (config resolution incl. secret placeholders and `key=value` override parsing, provider/model builders incl. variants, command parsing/replies for status/up/down/add/set/remove, RPC DTO round-trips, toast decisions, the `chooseProvision` dialog loop against a scripted dialog, the pure `dashboardView` row/total builder); runtime config in the service (overrides persisted, hash-changing edits tear down, idle-only edits patch, `add` picks the cheapest fitting pool, `remove` vs reset, variants published); `architecture.test.ts` enforcing the dependency rule.
 - Smoke (opt-in, `RUNPOD_API_KEY`): `scripts/smoke.ts` creates `Qwen/Qwen3-0.6B` on `AMPERE_16`, warms, sends one request, deletes; asserts spend < $0.10.
 - Manual e2e: load via local path in the user's global config; `/models` shows `runpod/*`; pick one, prompt → dialog → toasts → answer; `/runpod-status`; quit → endpoint gone in RunPod console.
 

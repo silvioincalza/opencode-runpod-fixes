@@ -8,11 +8,13 @@ export const decline: ProvisionDecision = { accepted: false }
 export class ScriptedConfirmation implements ConfirmationPort {
   answers: ProvisionDecision[]
   asked: ProvisionProposal[] = []
+  gate: Promise<void> | null = null
   constructor(answers: ProvisionDecision[] = [accept()]) {
     this.answers = [...answers]
   }
   async ask(proposal: ProvisionProposal): Promise<ProvisionDecision> {
     this.asked.push(proposal)
+    if (this.gate) await this.gate
     return this.answers.length > 1 ? this.answers.shift()! : (this.answers[0] ?? accept())
   }
 }

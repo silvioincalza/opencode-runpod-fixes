@@ -16,11 +16,14 @@ export class FakeCompute implements ComputeProviderPort {
   billed: number | null = null
   failCreate: Error | null = null
   failDelete: Error | null = null
+  failList: Error | null = null
+  deleteGate: Promise<void> | null = null
   private warmups: PendingWarmup[] = []
   private nextId = 1
 
   async list(): Promise<RemoteEndpoint[]> {
     this.calls.push("list")
+    if (this.failList) throw this.failList
     return this.remote.map((e) => ({ ...e }))
   }
 
@@ -39,6 +42,7 @@ export class FakeCompute implements ComputeProviderPort {
 
   async delete(id: string): Promise<void> {
     this.calls.push(`delete:${id}`)
+    if (this.deleteGate) await this.deleteGate
     if (this.failDelete) throw this.failDelete
     this.remote = this.remote.filter((e) => e.id !== id)
   }

@@ -46,6 +46,7 @@ interface ModelState {
   idleTimer: unknown
   meter: SpendMeter
   rate: PoolRate | null
+  warmAbort: AbortController | null
 }
 
 interface Priced {
@@ -55,6 +56,10 @@ interface Priced {
 }
 
 const round = (n: number) => Math.round(n * 1000) / 1000
+/** Abort reason used when an endpoint is deleted during its cold start. */
+const CANCELLED = Symbol("cancelled")
+/** $/h for `gpuCount` GPUs at `rate`, rounded to 4 decimals (0 when the price is unknown). */
+const hourlyRate = (rate: PoolRate | null, gpuCount: number) => Math.round((rate?.ratePerHour ?? 0) * gpuCount * 1e4) / 1e4
 export const recordKey = (modelID: string) => `endpoints/${modelID}`
 export const weightsKey = (hf: string) => `weights/${hf}`
 export const overridesKey = (modelID: string) => `overrides/${modelID}`
@@ -82,8 +87,9 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
   async ensureReady(modelID: string, opts: { skipConfirm?: boolean; gpu?: string } = {}): Promise<string> {
     const st = this.state(modelID)
     if (st.inflight) return st.inflight
+    if (st.phase === "deleting") throw this.busy(st)
     const run = (async () => {
-      if (opts.gpu !== undefined && opts.gpu !== st.model.gpu) await this.set(modelID, { gpu: opts.gpu })
+      if (opts.gpu !== undefined && opts.gpu !== st.model.gpu) await this.reconfigure(st, { gpu: opts.gpu })
       return this.run(st, opts)
     })().finally(() => {
       st.inflight = null
@@ -114,99 +120,141 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
     }
     const compute = this.ports.compute
     if (compute) {
-      this.orphans = []
-      const remote = await compute.list()
-      const byId = new Map(remote.map((ep) => [ep.id, ep] as const))
-      for (const st of this.states.values()) {
-        const stored = await this.ports.store.get<EndpointRecord>(recordKey(st.model.id))
-        if (!stored) continue
-        const ep = byId.get(stored.endpointID)
-        if (ep && ep.hash === this.expectedHash(st.model)) {
-          st.record = stored
-          st.rate = await this.rateFor(st.model)
-          this.setPhase(st, "idle", "restored endpoint from storage")
-        } else {
-          await this.ports.store.remove(recordKey(st.model.id))
-        }
-      }
-      for (const ep of remote) {
-        const modelID = modelIDFromName(ep.name)
-        if (modelID === null) continue
-        const st = this.states.get(modelID)
-        if (st?.record?.endpointID === ep.id) continue
-        const matches = st !== undefined && ep.hash !== null && ep.hash === this.expectedHash(st.model)
-        if (st && !st.record && this.settings.adoptExisting && matches) {
-          st.record = { endpointID: ep.id, name: ep.name, modelID, gpu: st.model.gpu, gpuCount: st.model.gpuCount, hash: ep.hash!, createdAt: this.ports.clock.now(), spendUsd: 0 }
-          await this.ports.store.set(recordKey(modelID), st.record)
-          st.rate = await this.rateFor(st.model)
-          this.setPhase(st, "idle", "adopted existing endpoint")
-          continue
-        }
-        // Ours (a configured model) but stale — different config or a duplicate: it would be replaced on next use anyway.
-        const stale = st !== undefined && (!matches || st.record !== null)
-        if (stale) {
-          try {
-            await compute.delete(ep.id)
-            this.ports.logger.info("deleted stale endpoint", { id: ep.id, name: ep.name })
-            continue
-          } catch (error) {
-            this.ports.logger.warn("failed to delete stale endpoint", { id: ep.id, error: String(error) })
-          }
-        }
-        // Unknown model (removed from config, or another opencode location's): never deleted automatically.
-        this.orphans.push({ id: ep.id, name: ep.name })
+      try {
+        await this.reconcile(compute)
+      } catch (error) {
+        this.ports.logger.warn("startup reconcile failed", { error: String(error) })
+        this.ports.notifier.notice("warning", `RunPod: could not reconcile endpoints at startup (${(error as Error).message}); stored endpoints are re-checked on the next start.`)
       }
     }
     await this.publish()
   }
 
+  private async reconcile(compute: ComputeProviderPort): Promise<void> {
+    this.orphans = []
+    const remote = await compute.list()
+    const byId = new Map(remote.map((ep) => [ep.id, ep] as const))
+    for (const st of this.states.values()) {
+      const stored = await this.ports.store.get<EndpointRecord>(recordKey(st.model.id))
+      if (!stored) continue
+      const ep = byId.get(stored.endpointID)
+      if (ep && ep.hash === this.expectedHash(st.model)) {
+        st.record = stored
+        st.rate = await this.knownRate(st.model)
+        this.setPhase(st, "idle", "restored endpoint from storage")
+      } else {
+        await this.ports.store.remove(recordKey(st.model.id))
+      }
+    }
+    for (const ep of remote) {
+      const modelID = modelIDFromName(ep.name)
+      if (modelID === null) continue
+      const st = this.states.get(modelID)
+      if (st?.record?.endpointID === ep.id) continue
+      const matches = st !== undefined && ep.hash !== null && ep.hash === this.expectedHash(st.model)
+      if (st && !st.record && this.settings.adoptExisting && matches) {
+        st.record = { endpointID: ep.id, name: ep.name, modelID, gpu: st.model.gpu, gpuCount: st.model.gpuCount, hash: ep.hash!, createdAt: this.ports.clock.now(), spendUsd: 0 }
+        await this.ports.store.set(recordKey(modelID), st.record)
+        st.rate = await this.knownRate(st.model)
+        this.setPhase(st, "idle", "adopted existing endpoint")
+        continue
+      }
+      // Ours (a configured model) but stale — different config or a duplicate: it would be replaced on next use anyway.
+      const stale = st !== undefined && (!matches || st.record !== null)
+      if (stale) {
+        try {
+          await compute.delete(ep.id)
+          this.ports.logger.info("deleted stale endpoint", { id: ep.id, name: ep.name })
+          continue
+        } catch (error) {
+          this.ports.logger.warn("failed to delete stale endpoint", { id: ep.id, error: String(error) })
+        }
+      }
+      // Unknown model (removed from config, or another opencode location's): never deleted automatically.
+      this.orphans.push({ id: ep.id, name: ep.name })
+    }
+  }
+
   /** Best-effort teardown within a time budget; used at plugin shutdown. */
   async stop(budgetMs = 10_000): Promise<void> {
     if (!this.settings.deleteOnExit) return
-    await Promise.race([
-      this.down().catch((error: unknown) => {
-        this.ports.logger.warn("shutdown cleanup failed", { error: String(error) })
-      }),
-      this.ports.clock.sleep(budgetMs),
-    ])
+    let timer: unknown = null
+    const budget = new Promise<void>((resolve) => {
+      timer = this.ports.clock.setTimer(resolve, budgetMs)
+    })
+    try {
+      await Promise.race([
+        this.down().catch((error: unknown) => {
+          this.ports.logger.warn("shutdown cleanup failed", { error: String(error) })
+        }),
+        budget,
+      ])
+    } finally {
+      this.ports.clock.clearTimer(timer)
+    }
   }
 
   async down(modelID?: string): Promise<string[]> {
     const compute = this.compute()
     const targets = modelID === undefined ? [...this.states.values()] : [this.state(modelID)]
     const deleted: string[] = []
+    const failures: string[] = []
     for (const st of targets) {
-      const record = st.record
-      if (!record) continue
-      this.setPhase(st, "deleting", `deleting ${record.endpointID}`)
+      // Another operation owns the model — except a cold start, which teardown() cancels.
+      if (st.phase === "deleting" || (st.inflight !== null && st.phase !== "warming")) {
+        if (modelID !== undefined) throw this.busy(st)
+        continue
+      }
+      if (!st.record) continue
       try {
-        await compute.scaleToZero(record.endpointID)
+        await this.teardown(st, compute)
+        deleted.push(st.model.id)
       } catch (error) {
-        this.ports.logger.warn("scale-to-zero before delete failed", { error: String(error) })
+        if (modelID !== undefined) throw error
+        failures.push(`${st.model.id} (${(error as Error).message})`)
       }
-      try {
-        await compute.delete(record.endpointID)
-      } catch (error) {
-        this.setPhase(st, "error", `delete failed: ${(error as Error).message}`)
-        throw error
-      }
-      if (st.idleTimer !== null) {
-        this.ports.clock.clearTimer(st.idleTimer)
-        st.idleTimer = null
-      }
-      st.meter.stop(this.ports.clock.now())
-      st.record = null
-      await this.ports.store.remove(recordKey(st.model.id))
-      this.setPhase(st, "cold", `deleted · ≈$${st.meter.usd().toFixed(2)} this session`)
-      deleted.push(st.model.id)
+    }
+    if (failures.length > 0) {
+      const done = deleted.length > 0 ? `; deleted ${deleted.join(", ")}` : ""
+      throw new Error(`RunPod: could not delete ${failures.join(", ")}${done}`)
     }
     return deleted
+  }
+
+  /** Scales the endpoint to zero and deletes it, cancelling its cold start if one is running. Callers check busy-ness. */
+  private async teardown(st: ModelState, compute: ComputeProviderPort): Promise<void> {
+    const record = st.record!
+    this.setPhase(st, "deleting", `deleting ${record.endpointID}`)
+    st.warmAbort?.abort(CANCELLED)
+    try {
+      await compute.scaleToZero(record.endpointID)
+    } catch (error) {
+      this.ports.logger.warn("scale-to-zero before delete failed", { error: String(error) })
+    }
+    try {
+      await compute.delete(record.endpointID)
+    } catch (error) {
+      this.setPhase(st, "error", `delete failed: ${(error as Error).message}`)
+      throw error
+    }
+    if (st.idleTimer !== null) {
+      this.ports.clock.clearTimer(st.idleTimer)
+      st.idleTimer = null
+    }
+    st.meter.stop(this.ports.clock.now())
+    st.record = null
+    this.billedCache.delete(record.endpointID)
+    await this.ports.store.remove(recordKey(st.model.id))
+    this.setPhase(st, "cold", `deleted · ≈$${st.meter.usd().toFixed(2)} this session`)
   }
 
   async status(): Promise<StatusReport> {
     const models: ModelStatus[] = []
     for (const st of this.states.values()) {
-      st.rate = await this.rateFor(st.model)
+      // Display rate: fresh from the catalog, else the rate captured when the endpoint was priced. Never written back —
+      // st.rate is what the meter charges, and a failed lookup (ratePerHour 0) must not replace it.
+      const lookup = await this.rateFor(st.model)
+      const rate = lookup.ratePerHour > 0 || st.rate === null ? lookup : st.rate
       let billedUsd: number | null = null
       let workers: WorkerCounts | null = null
       if (st.record && this.ports.compute) {
@@ -219,9 +267,9 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
         phase: st.phase,
         detail: st.detail,
         spendUsd: round(st.meter.usd()),
-        ratePerHour: this.hourly(st),
+        ratePerHour: hourlyRate(rate, st.model.gpuCount),
         gpu: st.model.gpu,
-        gpuLabel: st.rate.label,
+        gpuLabel: rate.label,
         endpointID: st.record?.endpointID ?? null,
         gpuCount: st.model.gpuCount,
         billedUsd,
@@ -269,47 +317,58 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
       config.weightsGb = weightsGb
     }
     this.validateOverrides({ gpu: config.gpu, gpuCount: config.gpuCount, context: config.context, output: config.output, idleTimeout: config.idleTimeout })
+    await this.ports.store.set(modelKey(id), config)
     this.newState(config)
     this.runtimeIDs.add(id)
-    await this.ports.store.set(modelKey(id), config)
     await this.publish()
     return config
   }
 
   async set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig> {
     const st = this.state(modelID)
+    this.ensureNotBusy(st)
+    return this.reconfigure(st, overrides)
+  }
+
+  /** set() without the busy guard: ensureReady applies a variant pool through it from inside its own request. */
+  private async reconfigure(st: ModelState, overrides: ModelOverrides): Promise<ModelConfig> {
     this.validateOverrides(overrides)
-    const next = applyOverrides(st.model, overrides)
-    const record = st.record
-    if (record) {
-      if (this.expectedHash(st.model) !== this.expectedHash(next)) {
-        this.ports.notifier.notice("info", `RunPod: configuration of ${modelID} changed; endpoint ${record.endpointID} is deleted and will be re-provisioned on next use.`)
-        await this.down(modelID)
-      } else if (idleTimeoutFor(next, this.settings) !== idleTimeoutFor(st.model, this.settings)) {
-        await this.compute().setIdleTimeout(record.endpointID, idleTimeoutFor(next, this.settings))
-      }
-    }
+    await this.syncEndpoint(st, applyOverrides(st.model, overrides))
     await this.applyOverridesTo(st, overrides)
     if (st.phase === "ready") this.armIdle(st)
     return st.model
   }
 
+  /** Brings a live endpoint in line with `next`: a spec-hash change deletes it (re-provisioned on next use), an idle-only change patches it. */
+  private async syncEndpoint(st: ModelState, next: ModelConfig): Promise<void> {
+    const record = st.record
+    if (!record) return
+    if (this.expectedHash(st.model) !== this.expectedHash(next)) {
+      await this.teardown(st, this.compute())
+      this.ports.notifier.notice("info", `RunPod: configuration of ${st.model.id} changed; endpoint ${record.endpointID} was deleted and will be re-provisioned on next use.`)
+    } else if (idleTimeoutFor(next, this.settings) !== idleTimeoutFor(st.model, this.settings)) {
+      await this.compute().setIdleTimeout(record.endpointID, idleTimeoutFor(next, this.settings))
+    }
+  }
+
   async remove(modelID: string): Promise<"removed" | "reset"> {
     const st = this.state(modelID)
+    this.ensureNotBusy(st)
     if (this.runtimeIDs.has(modelID)) {
-      if (st.record) await this.down(modelID)
+      if (st.record) await this.teardown(st, this.compute())
+      await this.ports.store.remove(modelKey(modelID))
       if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
       this.states.delete(modelID)
       this.runtimeIDs.delete(modelID)
-      await this.ports.store.remove(modelKey(modelID))
       await this.publish()
       return "removed"
     }
     const base = findModel(this.settings, modelID)!
-    if (st.record && this.expectedHash(st.model) !== this.expectedHash(base)) await this.down(modelID)
+    await this.syncEndpoint(st, base)
+    await this.ports.store.remove(overridesKey(modelID))
     st.model = base
     st.rate = null
-    await this.ports.store.remove(overridesKey(modelID))
+    if (st.phase === "ready") this.armIdle(st)
     await this.publish()
     return "reset"
   }
@@ -341,6 +400,7 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
       idleTimer: null,
       meter: new SpendMeter(() => this.ports.clock.now()),
       rate: null,
+      warmAbort: null,
     }
     this.states.set(model.id, st)
     return st
@@ -359,6 +419,21 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
     return this.ports.compute
   }
 
+  private busy(st: ModelState): Error {
+    return new Error(`RunPod: ${st.model.id} is busy (${st.phase}); try again when the current operation finishes.`)
+  }
+
+  /** Throws when another operation owns the model: a request in flight or a teardown in progress. */
+  private ensureNotBusy(st: ModelState): void {
+    if (st.inflight !== null || st.phase === "deleting") throw this.busy(st)
+  }
+
+  /** The pool's catalog rate, or null when unknown. A failed lookup is never cached as the metering rate (I3). */
+  private async knownRate(model: ModelConfig): Promise<PoolRate | null> {
+    const rate = await this.rateFor(model)
+    return rate.ratePerHour > 0 ? rate : null
+  }
+
   private async run(st: ModelState, opts: { skipConfirm?: boolean }): Promise<string> {
     const compute = this.compute()
     if (!st.record) {
@@ -371,8 +446,11 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
       }
     }
     if (st.phase !== "ready") await this.warm(st, compute)
+    const record = st.record
+    // teardown() may have deleted the endpoint while this request was starting it.
+    if (!record) throw new Error(`RunPod: ${st.model.id} was torn down while starting; retry.`)
     this.touch(st)
-    return compute.inferenceBaseURL(st.record!.endpointID)
+    return compute.inferenceBaseURL(record.endpointID)
   }
 
   /** Quote → (proposal → decision → validated, re-priced, persisted overrides) → create. */
@@ -531,10 +609,11 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
     const record = st.record!
     const clock = this.ports.clock
     const started = clock.now()
-    if (!st.rate) st.rate = await this.rateFor(st.model)
+    if (!st.rate) st.rate = await this.knownRate(st.model)
     st.meter.start(this.hourly(st), started)
     this.setPhase(st, "warming", "starting worker", 0)
     const controller = new AbortController()
+    st.warmAbort = controller
     const deadline = clock.setTimer(() => controller.abort(), this.settings.coldStartTimeoutSec * 1000)
     void this.pollHealth(st, record.endpointID, controller.signal, started, compute)
     let lastError: unknown = null
@@ -553,13 +632,17 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
           await clock.sleep(WARMUP_RETRY_MS)
         }
       }
+      if (controller.signal.reason === CANCELLED) {
+        // teardown() owns the phase, meter and record from here on.
+        throw new Error(`RunPod: cold start of ${st.model.id} was cancelled: endpoint ${record.endpointID} is being deleted.`)
+      }
       st.meter.stop(clock.now())
       const elapsed = this.elapsed(started)
       const reason = controller.signal.aborted
         ? `timed out after ${elapsed}s`
         : `failed after ${elapsed}s: ${(lastError as Error | null)?.message ?? "unknown error"}`
       const diagnostics = await compute.diagnostics(record.endpointID).catch(() => null)
-      this.setPhase(st, "cold", `cold start ${reason}`)
+      if (st.phase === "warming") this.setPhase(st, "cold", `cold start ${reason}`)
       throw new Error(
         `RunPod: cold start of ${st.model.id} ${reason}. Endpoint ${record.endpointID} was kept; retry, or run /runpod-down ${st.model.id}.` +
           (diagnostics ? `\nWorker log tail:\n${diagnostics}` : ""),
@@ -567,6 +650,7 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
     } finally {
       clock.clearTimer(deadline)
       controller.abort()
+      if (st.warmAbort === controller) st.warmAbort = null
     }
   }
 
@@ -629,7 +713,7 @@ export class EndpointService implements ModelRoutingPort, OperationsPort, Lifecy
   }
 
   protected hourly(st: ModelState): number {
-    return Math.round((st.rate?.ratePerHour ?? 0) * st.model.gpuCount * 1e4) / 1e4
+    return hourlyRate(st.rate, st.model.gpuCount)
   }
 
   protected elapsed(started: number): number {

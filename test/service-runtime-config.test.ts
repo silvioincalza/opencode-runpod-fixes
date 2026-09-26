@@ -130,3 +130,26 @@ test("a variant pool passed to ensureReady is applied as an override before prov
   assert.equal(switching.compute.created[1]!.gpu.pool, "AMPERE_16")
   assert.equal(switching.confirmation.asked.length, 2)
 })
+
+test("resetting a static model restores the base idle timeout on its live endpoint and re-arms the idle timer", async () => {
+  const h = harness()
+  await warm(h)
+  await h.service.set("m", { idleTimeout: 30 })
+  assert.ok(h.compute.calls.includes("setIdleTimeout:ep1:30"))
+  assert.equal(await h.service.remove("m"), "reset")
+  assert.ok(h.compute.calls.includes("setIdleTimeout:ep1:120"))
+  assert.equal(h.service.models()[0]!.idleTimeout, null)
+  await h.clock.advance(30_000 + IDLE_GRACE_MS) // the 30 s window no longer applies
+  assert.equal(h.service.phase("m"), "ready")
+  await h.clock.advance(90_000) // t = 135 s = base 120 s window + grace
+  assert.equal(h.service.phase("m"), "idle")
+})
+
+test("add persists before registering the model, so a failed write leaves nothing behind", async () => {
+  const h = harness()
+  h.store.failWrites = (key) => key.startsWith("models/")
+  await assert.rejects(h.service.add({ hf: "Qwen/Qwen3-8B" }), /write failed: models\/qwen3-8b/)
+  assert.deepEqual(h.service.models().map((m) => m.id), ["m"])
+  h.store.failWrites = null
+  assert.equal((await h.service.add({ hf: "Qwen/Qwen3-8B" })).id, "qwen3-8b")
+})

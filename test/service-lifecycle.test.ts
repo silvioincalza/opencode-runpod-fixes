@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { BILLING_TTL_MS } from "../src/core/application/endpoint-service.ts"
+import { BILLING_TTL_MS, EndpointService, IDLE_GRACE_MS } from "../src/core/application/endpoint-service.ts"
 import { specHashFor, type EndpointRecord } from "../src/core/domain/endpoint.ts"
 import { flush } from "./fakes/clock.ts"
 import { harness, sampleModel } from "./fakes/fixtures.ts"
@@ -153,4 +153,66 @@ test("status reports phase, endpoint, rate, spend, billed, live workers and orph
   assert.equal(later.phase, "idle")
   assert.equal(later.billedUsd, 1.5)
   assert.equal(later.workers, null)
+})
+
+test("start still publishes the catalog and warns when RunPod cannot be listed", async () => {
+  const h = harness()
+  await h.store.set("models/extra", sampleModel({ id: "extra", name: "Extra" }))
+  h.compute.failList = new Error("fetch failed")
+  await h.service.start()
+  assert.deepEqual(h.publisher.latest?.map((m) => m.config.id), ["m", "extra"])
+  const notice = h.notifier.notices.at(-1)
+  assert.equal(notice?.level, "warning")
+  assert.match(notice?.message ?? "", /could not reconcile endpoints at startup \(fetch failed\)/)
+  assert.equal(h.service.phase("m"), "cold")
+})
+
+test("down() for all keeps going after a failed delete and reports every failure", async () => {
+  const two = harness({ models: [sampleModel(), sampleModel({ id: "n", hf: "Qwen/Qwen3-8B", gpu: "AMPERE_16" })] })
+  await warm(two, "m")
+  await warm(two, "n")
+  two.compute.failDelete = new Error("forbidden")
+  await assert.rejects(two.service.down(), /could not delete m \(forbidden\), n \(forbidden\)/)
+  assert.ok(two.compute.calls.includes("delete:ep1"))
+  assert.ok(two.compute.calls.includes("delete:ep2"))
+  assert.equal(two.service.phase("n"), "error")
+})
+
+test("a restarted service recognises the endpoint it created (create-time hash equals the reconcile hash)", async () => {
+  const h = harness()
+  await warm(h)
+  const restarted = new EndpointService(h.settings, {
+    compute: h.compute,
+    catalog: h.catalog,
+    weights: h.weights,
+    recipe: h.recipe,
+    store: h.store,
+    clock: h.clock,
+    confirmation: h.confirmation,
+    notifier: h.notifier,
+    publisher: h.publisher,
+    logger: h.logger,
+  })
+  await restarted.start()
+  assert.equal(restarted.phase("m"), "idle")
+  assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
+  const p = restarted.ensureReady("m") // restored → warms without a dialog or a second endpoint
+  await flush()
+  assert.equal(h.confirmation.asked.length, 1)
+  assert.equal(h.compute.created.length, 1)
+  h.compute.finishWarmup()
+  assert.equal(await p, "https://compute.test/ep1/v1")
+})
+
+test("a failed price lookup in status() does not replace the rate the meter charges", async () => {
+  const h = harness()
+  await warm(h) // ready at t=0, metering $1.22/h
+  h.catalog.fail = true
+  assert.equal((await h.service.status()).models[0]!.ratePerHour, 1.22) // falls back to the rate captured at provisioning
+  await h.clock.advance(120_000 + IDLE_GRACE_MS) // idle; the meter stopped at t=120s
+  const before = (await h.service.status()).models[0]!.spendUsd
+  await warm(h) // re-warm while the catalog is still down
+  await h.clock.advance(60_000)
+  const after = (await h.service.status()).models[0]!.spendUsd
+  assert.ok(after > before, `the re-warmed worker is metered (${before} → ${after})`)
 })

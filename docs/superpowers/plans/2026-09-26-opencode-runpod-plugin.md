@@ -3726,6 +3726,63 @@ test("catalogGpus and listWorkers unwrap items", async () => {
   assert.match(calls[0]!.url, /\/v2\/catalog\/gpus\?product=SERVERLESS$/)
   assert.equal((await c.listWorkers("ep1"))[0]!.status, "UNHEALTHY")
 })
+
+const createBody = { name: "oc-runpod-m", type: "QUEUE" as const, scaling: { type: "QUEUE_DELAY" as const, queueDelay: 1 }, gpu: { pools: ["AMPERE_48"], count: 1 }, image: "img", env: {}, disk: 20, workers: { min: 0, max: 1, idleTimeout: 120 }, timeout: 600000, flashboot: "FLASHBOOT" as const }
+
+test("createEndpoint is not re-sent after an ambiguous failure; only 429 is retried", async () => {
+  const network = client([() => { throw new Error("socket hang up") }])
+  await assert.rejects(network.c.createEndpoint(createBody), /socket hang up/)
+  assert.equal(network.calls.length, 1)
+  const gateway = client([json(502, { title: "Bad Gateway" })])
+  await assert.rejects(gateway.c.createEndpoint(createBody), (e: unknown) => e instanceof RunpodError && e.status === 502)
+  assert.equal(gateway.calls.length, 1)
+  const limited = client([json(429, { title: "Too Many" }), json(201, { id: "ep1", name: "oc-runpod-m" })])
+  assert.equal((await limited.c.createEndpoint(createBody)).id, "ep1")
+  assert.equal(limited.calls.length, 2)
+})
+
+test("idempotent requests retry network errors, then succeed", async () => {
+  const sleeps: number[] = []
+  const { c, calls } = client([() => { throw new Error("ECONNRESET") }, json(200, { id: "ep1", name: "n" })], sleeps)
+  assert.equal((await c.getEndpoint("ep1")).id, "ep1")
+  assert.equal(calls.length, 2)
+  assert.deepEqual(sleeps, [1000])
+})
+
+test("listEndpoints stops on a repeated cursor instead of looping forever", async () => {
+  const { c, calls } = client([
+    json(200, { data: [{ id: "a", name: "oc-runpod-a" }], pagination: { nextCursor: "c1", hasNextPage: true } }),
+    json(200, { data: [{ id: "b", name: "oc-runpod-b" }], pagination: { nextCursor: "c1", hasNextPage: true } }),
+  ])
+  await assert.rejects(c.listEndpoints(), /repeated cursor "c1"/)
+  assert.equal(calls.length, 2)
+})
+
+test("listEndpoints gives up after 100 pages", async () => {
+  const { c, calls } = client(Array.from({ length: 100 }, (_, i) => json(200, { data: [], pagination: { nextCursor: `c${i}`, hasNextPage: true } })))
+  await assert.rejects(c.listEndpoints(), /exceeded 100 pages/)
+  assert.equal(calls.length, 100)
+})
+
+test("API keys echoed in a problem title or message are redacted too", async () => {
+  const { c } = client([json(401, { title: "bad rp_key", message: "key rp_key rejected" })])
+  await assert.rejects(c.listEndpoints(), (error: unknown) => {
+    assert.ok(error instanceof RunpodError)
+    assert.equal(error.title, "bad [redacted]")
+    assert.equal(error.detail, "key [redacted] rejected")
+    return true
+  })
+})
+
+test("a 2xx body that is not JSON becomes a RunpodError without echoing the body", async () => {
+  const { c } = client([new Response("invalid key rp_key", { status: 200 })])
+  await assert.rejects(c.getEndpoint("ep1"), (error: unknown) => {
+    assert.ok(error instanceof RunpodError)
+    assert.equal(error.title, "invalid JSON response")
+    assert.ok(!error.message.includes("rp_key"))
+    return true
+  })
+})
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -3773,6 +3830,8 @@ export interface ChatCompletionBody {
 interface RequestInitLike {
   signal?: AbortSignal
   text?: boolean
+  /** false for requests that must not be re-sent after an ambiguous failure (network error or 5xx): only 429 is retried. */
+  idempotent?: boolean
 }
 
 export class RunpodHttp {
@@ -3798,18 +3857,24 @@ export class RunpodHttp {
 
   async listEndpoints(): Promise<EndpointInfo[]> {
     const out: EndpointInfo[] = []
+    const seen = new Set<string>()
     let cursor: string | undefined
-    do {
+    for (let pages = 1; ; pages++) {
       const url = `${this.apiBase}/serverless${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`
       const page = await this.request<unknown>("GET", url)
       out.push(...extractItems<EndpointInfo>(page))
-      cursor = nextCursor(page)
-    } while (cursor)
-    return out
+      const next = nextCursor(page)
+      if (next === undefined) return out
+      if (seen.has(next)) throw new Error(`RunPod: endpoint listing repeated cursor ${JSON.stringify(next)}`)
+      if (pages >= MAX_PAGES) throw new Error(`RunPod: endpoint listing exceeded ${MAX_PAGES} pages`)
+      seen.add(next)
+      cursor = next
+    }
   }
 
   createEndpoint(body: CreateEndpointRequest): Promise<EndpointInfo> {
-    return this.request<EndpointInfo>("POST", `${this.apiBase}/serverless`, body)
+    // A retried create after a lost response would leave a duplicate endpoint.
+    return this.request<EndpointInfo>("POST", `${this.apiBase}/serverless`, body, { idempotent: false })
   }
 
   getEndpoint(id: string): Promise<EndpointInfo> {
@@ -3880,12 +3945,14 @@ export class RunpodHttp {
           signal: init.signal,
         })
       } catch (error) {
-        if (init.signal?.aborted || attempt >= this.maxRetries) throw error
+        // A network error is ambiguous — the server may have acted — so a non-idempotent request is never re-sent.
+        if (init.signal?.aborted || init.idempotent === false || attempt >= this.maxRetries) throw error
         await this.sleep(1000 * 2 ** attempt)
         continue
       }
-      if (response.status === 429 || response.status >= 500) {
+      if (response.status === 429 || (response.status >= 500 && init.idempotent !== false)) {
         if (attempt >= this.maxRetries) throw await this.toError(response, context)
+        await response.body?.cancel().catch(() => {})
         await this.sleep(1000 * 2 ** attempt)
         continue
       }
@@ -3893,7 +3960,13 @@ export class RunpodHttp {
       if (response.status === 204) return undefined as T
       const text = await response.text()
       if (init.text) return text as T
-      return (text ? JSON.parse(text) : undefined) as T
+      if (!text) return undefined as T
+      try {
+        return JSON.parse(text) as T
+      } catch {
+        // Never echo the body: it is server text and could carry anything, the API key included.
+        throw new RunpodError(response.status, "invalid JSON response", null, context)
+      }
     }
   }
 
@@ -3923,6 +3996,9 @@ export type RunpodHttpLike = Pick<
 >
 
 const ITEM_KEYS = ["data", "items", "endpoints", "results", "workers", "gpus", "records"] as const
+
+/** Upper bound on pages followed by listEndpoints: a server that never stops paginating must not hang startup. */
+const MAX_PAGES = 100
 
 function extractItems<T>(page: unknown): T[] {
   if (Array.isArray(page)) return page as T[]

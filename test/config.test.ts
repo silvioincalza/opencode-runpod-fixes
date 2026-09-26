@@ -102,3 +102,23 @@ test("parseOverrides rejects malformed pairs, unknown keys and bad values with t
   assert.throws(() => parseOverrides(["context=100"]), /context/)
   assert.throws(() => parseOverrides(["hf=not-a-repo"]), /hf/)
 })
+
+test("an explicit apiKey/hfToken that does not resolve never falls back to the environment", () => {
+  const env = { RUNPOD_API_KEY: "rp_personal", HF_TOKEN: "hf_personal" }
+  const explicit = resolve({ apiKey: "{env:WORK_KEY}", hfToken: "{env:WORK_HF}" }, env).secrets
+  assert.equal(explicit.apiKey, null)
+  assert.equal(explicit.hfToken, null)
+  assert.equal(resolve({ apiKey: "" }, env).secrets.apiKey, null)
+  const absent = resolve({}, env).secrets
+  assert.equal(absent.apiKey, "rp_personal")
+  assert.equal(absent.hfToken, "hf_personal")
+})
+
+test("explicit family null is accepted in options; empty parser and quantization values are rejected", () => {
+  const { settings } = resolve({ models: { m: { hf: "org/m", gpu: "AMPERE_48", family: null } } })
+  assert.equal(settings.models[0]!.family, null)
+  assert.throws(() => resolve({ models: { m: { hf: "org/m", gpu: "AMPERE_48", reasoningParser: "" } } }), /models\.m\.reasoningParser/)
+  assert.throws(() => parseOverrides(["toolParser="]), /toolParser/)
+  assert.throws(() => parseOverrides(["quantization="]), /quantization/)
+  assert.deepEqual(parseOverrides(["toolParser=null"]), { toolParser: null }) // explicit null still disables
+})

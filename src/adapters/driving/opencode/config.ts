@@ -12,10 +12,10 @@ export const ModelOptionsSchema = z.strictObject({
   context: z.number().int().min(1024).default(32768),
   output: z.number().int().min(256).default(8192),
   tools: z.boolean().default(true),
-  family: z.string().optional(),
-  toolParser: z.string().nullable().optional(),
-  reasoningParser: z.string().nullable().optional(),
-  quantization: z.string().nullable().optional(),
+  family: z.string().min(1).nullable().optional(),
+  toolParser: z.string().min(1).nullable().optional(),
+  reasoningParser: z.string().min(1).nullable().optional(),
+  quantization: z.string().min(1).nullable().optional(),
   weightsGb: z.number().positive().nullable().optional(),
   idleTimeout: z.number().int().min(1).max(3600).nullable().optional(),
   env: z.record(z.string(), z.string()).default({}),
@@ -49,10 +49,10 @@ export const OverridesSchema = z.strictObject({
   context: z.number().int().min(1024).optional(),
   output: z.number().int().min(256).optional(),
   tools: z.boolean().optional(),
-  family: z.string().nullable().optional(),
-  toolParser: z.string().nullable().optional(),
-  reasoningParser: z.string().nullable().optional(),
-  quantization: z.string().nullable().optional(),
+  family: z.string().min(1).nullable().optional(),
+  toolParser: z.string().min(1).nullable().optional(),
+  reasoningParser: z.string().min(1).nullable().optional(),
+  quantization: z.string().min(1).nullable().optional(),
   weightsGb: z.number().positive().nullable().optional(),
   idleTimeout: z.number().int().min(1).max(3600).nullable().optional(),
 })
@@ -155,8 +155,10 @@ export function resolveSettings(raw: unknown, deps: ResolveDeps): { settings: Se
     models,
   }
   const secrets: Secrets = {
-    apiKey: resolveSecret(o.apiKey, deps) ?? (env.RUNPOD_API_KEY?.trim() || null),
-    hfToken: resolveSecret(o.hfToken, deps) ?? (env.HF_TOKEN?.trim() || null),
+    // The env fallback applies only when the option is absent: an explicit option that does not resolve means "no key",
+    // never "some other key" (that would silently bill a different account).
+    apiKey: o.apiKey === undefined ? env.RUNPOD_API_KEY?.trim() || null : resolveSecret(o.apiKey, deps),
+    hfToken: o.hfToken === undefined ? env.HF_TOKEN?.trim() || null : resolveSecret(o.hfToken, deps),
   }
   return { settings, secrets }
 }

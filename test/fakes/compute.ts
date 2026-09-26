@@ -11,6 +11,7 @@ export class FakeCompute implements ComputeProviderPort {
   created: EndpointSpec[] = []
   calls: string[] = []
   healthSnapshot: HealthSnapshot = { initializing: 0, running: 0, idle: 0, throttled: 0 }
+  healthGate: Promise<void> | null = null
   diagnosticsText: string | null = null
   billed: number | null = null
   failCreate: Error | null = null
@@ -44,6 +45,7 @@ export class FakeCompute implements ComputeProviderPort {
 
   async health(id: string): Promise<HealthSnapshot> {
     this.calls.push(`health:${id}`)
+    if (this.healthGate) await this.healthGate
     return { ...this.healthSnapshot }
   }
 

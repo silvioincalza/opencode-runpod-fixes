@@ -1,5 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { HEALTH_POLL_MS } from "../src/core/application/endpoint-service.ts"
 import type { EndpointRecord } from "../src/core/domain/endpoint.ts"
 import { flush } from "./fakes/clock.ts"
 import { accept, decline } from "./fakes/confirmation.ts"
@@ -80,8 +81,11 @@ test("an override that breaks maxHourlyRate or names an unknown pool is refused 
   const unknown = harness({}, { answers: [accept({ gpu: "NOPE" })] })
   await assert.rejects(unknown.service.ensureReady("m"), /unknown GPU pool "NOPE" \(known: AMPERE_16, AMPERE_48, AMPERE_80\)/)
   assert.equal(await unknown.store.get("overrides/m"), undefined)
+  assert.equal(unknown.service.phase("m"), "cold")
+  assert.deepEqual(unknown.notifier.phases, ["confirming", "cold"])
   const badIdle = harness({}, { answers: [accept({ idleTimeout: 0 })] })
   await assert.rejects(badIdle.service.ensureReady("m"), /idleTimeout must be an integer between 1 and 3600/)
+  assert.equal(badIdle.service.phase("m"), "cold")
 })
 
 test("declined confirmation: nothing created, phase back to cold, actionable error", async () => {
@@ -168,4 +172,53 @@ test("create failure resets to cold and propagates", async () => {
   await assert.rejects(h.service.ensureReady("m"), /quota exceeded/)
   assert.equal(h.service.phase("m"), "cold")
   assert.equal(await h.store.get("endpoints/m"), undefined)
+})
+
+test("a health poll that resolves after warm-up finished does not revert ready to warming", async () => {
+  const h = harness()
+  let release: () => void = () => {}
+  h.compute.healthGate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const pending = h.service.ensureReady("m")
+  await flush()
+  await h.clock.advance(HEALTH_POLL_MS) // the poller wakes up and parks inside health()
+  assert.ok(h.compute.calls.includes("health:ep1"))
+  h.compute.finishWarmup()
+  await pending
+  assert.equal(h.service.phase("m"), "ready")
+  release()
+  await flush()
+  assert.equal(h.service.phase("m"), "ready")
+  assert.equal(h.notifier.events.at(-1)!.phase, "ready")
+})
+
+test("a failed override write leaves the in-memory config untouched and resets to cold", async () => {
+  const h = harness({}, { answers: [accept({ gpu: "AMPERE_80" })] })
+  h.store.failWrites = (key) => key.startsWith("overrides/")
+  await assert.rejects(h.service.ensureReady("m"), /write failed: overrides\/m/)
+  assert.equal(h.compute.created.length, 0)
+  assert.equal(h.service.phase("m"), "cold")
+  assert.deepEqual(h.notifier.phases, ["confirming", "cold"])
+  h.store.failWrites = null
+  const retry = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.confirmation.asked[1]!.quote.gpu, "AMPERE_48") // memory still holds the configured pool
+  assert.equal(h.compute.created[0]!.gpu.pool, "AMPERE_80")
+  h.compute.finishWarmup()
+  await retry
+})
+
+test("if the endpoint record cannot be stored, the created endpoint is kept and reused on retry", async () => {
+  const h = harness()
+  h.store.failWrites = (key) => key.startsWith("endpoints/")
+  await assert.rejects(h.service.ensureReady("m"), /write failed: endpoints\/m/)
+  assert.equal(h.compute.created.length, 1)
+  assert.equal(h.service.phase("m"), "cold")
+  h.store.failWrites = null
+  const retry = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.compute.created.length, 1) // no second endpoint
+  h.compute.finishWarmup()
+  assert.equal(await retry, "https://compute.test/ep1/v1")
 })

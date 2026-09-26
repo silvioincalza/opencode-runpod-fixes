@@ -2,10 +2,12 @@ import type { StateStorePort } from "../../src/core/ports/state-store.ts"
 
 export class InMemoryStateStore implements StateStorePort {
   readonly data = new Map<string, unknown>()
+  failWrites: ((key: string) => boolean) | null = null
   async get<T>(key: string): Promise<T | undefined> {
     return this.data.get(key) as T | undefined
   }
   async set(key: string, value: unknown): Promise<void> {
+    if (this.failWrites?.(key)) throw new Error(`write failed: ${key}`)
     this.data.set(key, structuredClone(value))
   }
   async remove(key: string): Promise<void> {

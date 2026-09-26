@@ -119,39 +119,50 @@ export class EndpointService implements ModelRoutingPort {
   private async run(st: ModelState, opts: { skipConfirm?: boolean }): Promise<string> {
     const compute = this.compute()
     if (!st.record) {
-      let priced = await this.price(st.model)
-      st.rate = priced.rate
-      if (priced.quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${priced.quote.blocked}`)
-      if (this.settings.confirm && !opts.skipConfirm) {
-        this.setPhase(st, "confirming", `waiting for confirmation · ${priced.quote.gpuLabel} · $${priced.quote.ratePerHour.toFixed(2)}/h`)
-        const proposal = buildProposal({ quote: priced.quote, model: st.model, pricing: await this.pricing(), weightsGb: priced.weightsGb })
-        const decision = await this.ports.confirmation.ask(proposal)
-        if (!decision.accepted) {
-          this.setPhase(st, "cold", "provisioning declined")
-          throw new Error(
-            `RunPod: provisioning of ${st.model.id} was declined or not confirmed within ${this.settings.confirmTimeoutSec}s. ` +
-              `Run /runpod-up ${st.model.id} to provision without the dialog, or set options.confirm=false.`,
-          )
-        }
-        const overrides = this.changedOverrides(st.model, decision.overrides)
-        if (overrides) {
-          this.validateOverrides(overrides)
-          const candidate = applyOverrides(st.model, overrides)
-          const repriced = await this.price(candidate)
-          if (repriced.quote.blocked) {
-            this.setPhase(st, "cold", `refused: ${repriced.quote.blocked}`)
-            throw new Error(`RunPod: refusing to provision ${st.model.id}: ${repriced.quote.blocked}`)
-          }
-          await this.applyOverridesTo(st, overrides)
-          priced = repriced
-          st.rate = repriced.rate
-        }
+      try {
+        await this.provision(st, opts, compute)
+      } catch (error) {
+        // Every failure before the endpoint is usable ends in `cold` (paths that already reset are left alone).
+        if (st.phase === "confirming" || st.phase === "creating") this.setPhase(st, "cold", `provisioning failed: ${(error as Error).message}`)
+        throw error
       }
-      await this.create(st, priced, compute)
     }
     if (st.phase !== "ready") await this.warm(st, compute)
     this.touch(st)
     return compute.inferenceBaseURL(st.record!.endpointID)
+  }
+
+  /** Quote → (proposal → decision → validated, re-priced, persisted overrides) → create. */
+  private async provision(st: ModelState, opts: { skipConfirm?: boolean }, compute: ComputeProviderPort): Promise<void> {
+    let priced = await this.price(st.model)
+    st.rate = priced.rate
+    if (priced.quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${priced.quote.blocked}`)
+    if (this.settings.confirm && !opts.skipConfirm) {
+      this.setPhase(st, "confirming", `waiting for confirmation · ${priced.quote.gpuLabel} · $${priced.quote.ratePerHour.toFixed(2)}/h`)
+      const proposal = buildProposal({ quote: priced.quote, model: st.model, pricing: await this.pricing(), weightsGb: priced.weightsGb })
+      const decision = await this.ports.confirmation.ask(proposal)
+      if (!decision.accepted) {
+        this.setPhase(st, "cold", "provisioning declined")
+        throw new Error(
+          `RunPod: provisioning of ${st.model.id} was declined or not confirmed within ${this.settings.confirmTimeoutSec}s. ` +
+            `Run /runpod-up ${st.model.id} to provision without the dialog, or set options.confirm=false.`,
+        )
+      }
+      const overrides = this.changedOverrides(st.model, decision.overrides)
+      if (overrides) {
+        this.validateOverrides(overrides)
+        const candidate = applyOverrides(st.model, overrides)
+        const repriced = await this.price(candidate)
+        if (repriced.quote.blocked) {
+          this.setPhase(st, "cold", `refused: ${repriced.quote.blocked}`)
+          throw new Error(`RunPod: refusing to provision ${st.model.id}: ${repriced.quote.blocked}`)
+        }
+        await this.applyOverridesTo(st, overrides)
+        priced = repriced
+        st.rate = repriced.rate
+      }
+    }
+    await this.create(st, priced, compute)
   }
 
   /** Only the parts of a dialog decision that differ from the effective config. */
@@ -184,14 +195,15 @@ export class EndpointService implements ModelRoutingPort {
 
   /** Applies validated overrides to the in-memory config, persists them and republishes the catalog. */
   protected async applyOverridesTo(st: ModelState, overrides: ModelOverrides): Promise<void> {
-    st.model = applyOverrides(st.model, overrides)
-    st.rate = null
+    const next = applyOverrides(st.model, overrides)
     if (this.runtimeIDs.has(st.model.id)) {
-      await this.ports.store.set(modelKey(st.model.id), st.model)
+      await this.ports.store.set(modelKey(st.model.id), next)
     } else {
       const stored = (await this.ports.store.get<ModelOverrides>(overridesKey(st.model.id))) ?? {}
       await this.ports.store.set(overridesKey(st.model.id), { ...stored, ...overrides })
     }
+    st.model = next
+    st.rate = null
     await this.publish()
   }
 
@@ -321,6 +333,7 @@ export class EndpointService implements ModelRoutingPort {
       if (signal.aborted || st.phase !== "warming") return
       try {
         const h = await compute.health(endpointID)
+        if (signal.aborted || st.phase !== "warming") return
         this.setPhase(st, "warming", `workers: initializing ${h.initializing} · running ${h.running} · idle ${h.idle} · throttled ${h.throttled}`, this.elapsed(started))
       } catch (error) {
         this.ports.logger.warn("health poll failed", { endpointID, error: String(error) })

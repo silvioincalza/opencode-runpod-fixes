@@ -4124,7 +4124,8 @@ class FakeHttp implements RunpodHttpLike {
   async catalogGpus() { return [] }
   async billedUsd() { return 0.5 }
   async health() { return { jobs: { completed: 0, failed: 0, inProgress: 0, inQueue: 0, retried: 0 }, workers: { idle: 1, initializing: 2, ready: 0, running: 3, throttled: 4 } } }
-  async chatCompletion(id: string) { this.calls.push(`chat:${id}`); if (this.chatError) throw this.chatError; return {} }
+  lastChat: { body: unknown; signal: AbortSignal } | null = null
+  async chatCompletion(id: string, body: unknown, signal: AbortSignal) { this.calls.push(`chat:${id}`); this.lastChat = { body, signal }; if (this.chatError) throw this.chatError; return {} }
 }
 
 test("toCreateBody maps the spec and appends markers after user env and secrets", () => {
@@ -4203,6 +4204,39 @@ test("diagnostics returns the last 40 log lines of an unhealthy worker, or null"
   assert.ok(tail?.startsWith("line 11"))
   assert.ok(tail?.endsWith("line 50"))
 })
+
+test("warmup posts a one-token ping for the served model name, forwards the abort signal, and treats 408 as transient", async () => {
+  const http = new FakeHttp()
+  const provider = new RunpodComputeProvider(http)
+  const controller = new AbortController()
+  await provider.warmup("ep1", "m", controller.signal)
+  assert.deepEqual(http.lastChat?.body, { model: "m", messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false })
+  assert.equal(http.lastChat?.signal, controller.signal)
+  http.chatError = new RunpodError(408, "Request Timeout", null, "POST")
+  await assert.rejects(provider.warmup("ep1", "m", controller.signal), (e: unknown) => e instanceof ComputeError && e.kind === "transient" && e.status === 408)
+})
+
+test("create sends exactly toCreateBody(spec); an empty minCudaVersion is omitted", async () => {
+  const http = new FakeHttp()
+  await new RunpodComputeProvider(http).create(spec)
+  assert.deepEqual(http.calls, [`create:${JSON.stringify(toCreateBody(spec))}`])
+  const body = toCreateBody({ ...spec, gpu: { ...spec.gpu, minCudaVersion: "" } })
+  assert.equal("minCudaVersion" in body.gpu, false)
+})
+
+test("diagnostics is best effort: log failures and empty logs yield null; CRLF logs are normalised", async () => {
+  const http = new FakeHttp()
+  const provider = new RunpodComputeProvider(http)
+  http.workers = [{ id: "w2", status: "UNHEALTHY" }]
+  http.logs = "  \n "
+  assert.equal(await provider.diagnostics("ep1"), null)
+  http.logs = "a\r\nb\r\n"
+  assert.equal(await provider.diagnostics("ep1"), "a\nb")
+  http.workerLogs = async () => {
+    throw new Error("gone")
+  }
+  assert.equal(await provider.diagnostics("ep1"), null)
+})
 ```
 
 `test/runpod-price-catalog.test.ts`:
@@ -4260,6 +4294,62 @@ test("knownPools lists the static table", () => {
   const catalog = new RunpodPriceCatalog(null, new FakeClock())
   assert.deepEqual([...catalog.knownPools()].sort(), Object.keys(POOLS).sort())
 })
+
+test("concurrent lookups share one catalog request", async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let calls = 0
+  const h = {
+    catalogGpus: async () => {
+      calls++
+      await gate
+      return [{ id: "x", pool: "AMPERE_16", price: { serverless: 0.6 } }]
+    },
+  }
+  const catalog = new RunpodPriceCatalog(h, new FakeClock())
+  const a = catalog.rate("AMPERE_16")
+  const b = catalog.rate("AMPERE_48")
+  release()
+  assert.equal((await a).ratePerHour, 0.6)
+  assert.equal((await b).source, "fallback") // AMPERE_48 is not in this live catalog
+  assert.equal(calls, 1)
+})
+
+test("a failed lookup is retried after a minute, not after the full TTL", async () => {
+  const clock = new FakeClock()
+  let fail = true
+  let calls = 0
+  const h = {
+    catalogGpus: async () => {
+      calls++
+      if (fail) throw new Error("blip")
+      return [{ id: "x", pool: "AMPERE_16", price: { serverless: 0.6 } }]
+    },
+  }
+  const catalog = new RunpodPriceCatalog(h, clock)
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback")
+  fail = false
+  await clock.advance(30_000)
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback") // the failure is remembered briefly, not hammered
+  assert.equal(calls, 1)
+  await clock.advance(31_000)
+  assert.deepEqual(await catalog.rate("AMPERE_16"), { ratePerHour: 0.6, source: "catalog", vramGb: POOLS.AMPERE_16.vramGb, label: POOLS.AMPERE_16.label })
+  assert.equal(calls, 2)
+})
+
+test("a zero live price is ignored in favour of the static table; the pool table fixes VRAM", async () => {
+  const catalog = new RunpodPriceCatalog(
+    http([
+      { id: "a", pool: "AMPERE_16", price: { serverless: 0 } },
+      { id: "b", pool: "AMPERE_48", memory: 49152, price: { serverless: 1.3 } },
+    ]),
+    new FakeClock(),
+  )
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback")
+  assert.equal((await catalog.rate("AMPERE_48")).vramGb, 48)
+})
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -4287,7 +4377,7 @@ export function toCreateBody(spec: EndpointSpec): CreateEndpointRequest {
     name: spec.name,
     type: "QUEUE",
     scaling: { type: "QUEUE_DELAY", queueDelay: 1 },
-    gpu: { pools: [spec.gpu.pool], count: spec.gpu.count, minCudaVersion: spec.gpu.minCudaVersion },
+    gpu: { pools: [spec.gpu.pool], count: spec.gpu.count },
     image: spec.recipe.image,
     env,
     disk: spec.recipe.diskGb,
@@ -4295,6 +4385,7 @@ export function toCreateBody(spec: EndpointSpec): CreateEndpointRequest {
     timeout: spec.executionTimeoutSec * 1000,
     flashboot: spec.flashboot ? "FLASHBOOT" : "OFF",
   }
+  if (spec.gpu.minCudaVersion) body.gpu.minCudaVersion = spec.gpu.minCudaVersion
   if (spec.dataCenterIds.length > 0) body.dataCenterIds = [...spec.dataCenterIds]
   return body
 }
@@ -4351,11 +4442,15 @@ export class RunpodComputeProvider implements ComputeProviderPort {
   }
 
   async diagnostics(id: string): Promise<string | null> {
-    const workers = await this.http.listWorkers(id)
-    const unhealthy = workers.find((w) => w.status.toUpperCase() === "UNHEALTHY")
-    if (!unhealthy) return null
-    const text = await this.http.workerLogs(id, unhealthy.id)
-    return text.trim().split("\n").slice(-LOG_TAIL_LINES).join("\n")
+    try {
+      const workers = await this.http.listWorkers(id)
+      const unhealthy = workers.find((w) => w.status.toUpperCase() === "UNHEALTHY")
+      if (!unhealthy) return null
+      const text = (await this.http.workerLogs(id, unhealthy.id)).replace(/\r\n?/g, "\n").trim()
+      return text ? text.split("\n").slice(-LOG_TAIL_LINES).join("\n") : null
+    } catch {
+      return null // best effort: the caller is already reporting a failed cold start
+    }
   }
 
   billedUsd(id: string): Promise<number | null> {
@@ -4378,12 +4473,15 @@ import { POOLS } from "./pools.ts"
 import type { GpuCatalogEntry } from "./types.ts"
 
 export const CATALOG_TTL_MS = 10 * 60_000
+/** A failed lookup is retried after this long: a broken catalog is not hammered, but a blip does not pin fallback prices for a full TTL. */
+export const CATALOG_FAILURE_TTL_MS = 60_000
 
 export class RunpodPriceCatalog implements PriceCatalogPort {
   private readonly http: { catalogGpus(): Promise<GpuCatalogEntry[]> } | null
   private readonly clock: ClockPort
   private readonly ttlMs: number
   private cache: { at: number; entries: GpuCatalogEntry[] | null } | null = null
+  private pending: Promise<GpuCatalogEntry[] | null> | null = null
 
   constructor(http: { catalogGpus(): Promise<GpuCatalogEntry[]> } | null, clock: ClockPort, ttlMs: number = CATALOG_TTL_MS) {
     this.http = http
@@ -4398,23 +4496,34 @@ export class RunpodPriceCatalog implements PriceCatalogPort {
   async rate(pool: string): Promise<PoolRate> {
     const info = POOLS[pool]
     const entries = await this.entries()
-    const live = entries?.find((e) => e.pool === pool && typeof e.price?.serverless === "number")
-    if (live) return { ratePerHour: live.price!.serverless!, source: "catalog", vramGb: live.memory ?? info?.vramGb ?? null, label: info?.label ?? pool }
+    const live = entries?.find((e) => e.pool === pool && (e.price?.serverless ?? 0) > 0)
+    // The pool id fixes the VRAM; the live catalog's `memory` is only a fallback for pools missing from the table.
+    if (live) return { ratePerHour: live.price!.serverless!, source: "catalog", vramGb: info?.vramGb ?? live.memory ?? null, label: info?.label ?? pool }
     return { ratePerHour: info?.fallbackUsdPerHour ?? 0, source: "fallback", vramGb: info?.vramGb ?? null, label: info?.label ?? pool }
   }
 
-  private async entries(): Promise<GpuCatalogEntry[] | null> {
-    if (!this.http) return null
+  private entries(): Promise<GpuCatalogEntry[] | null> {
+    const http = this.http
+    if (!http) return Promise.resolve(null)
     const now = this.clock.now()
-    if (this.cache && now - this.cache.at <= this.ttlMs) return this.cache.entries
-    let entries: GpuCatalogEntry[] | null = null
-    try {
-      entries = await this.http.catalogGpus()
-    } catch {
-      entries = null // remembered for one TTL so a broken catalog is not hammered
+    if (this.cache) {
+      const ttl = this.cache.entries === null ? Math.min(CATALOG_FAILURE_TTL_MS, this.ttlMs) : this.ttlMs
+      if (now - this.cache.at <= ttl) return Promise.resolve(this.cache.entries)
     }
-    this.cache = { at: now, entries }
-    return entries
+    // Concurrent callers share one lookup, so a slow failure can never overwrite a fresh success.
+    if (!this.pending) {
+      this.pending = http
+        .catalogGpus()
+        .catch(() => null)
+        .then((entries) => {
+          this.cache = { at: now, entries }
+          return entries
+        })
+        .finally(() => {
+          this.pending = null
+        })
+    }
+    return this.pending
   }
 }
 ```

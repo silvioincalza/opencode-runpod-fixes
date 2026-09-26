@@ -51,3 +51,59 @@ test("knownPools lists the static table", () => {
   const catalog = new RunpodPriceCatalog(null, new FakeClock())
   assert.deepEqual([...catalog.knownPools()].sort(), Object.keys(POOLS).sort())
 })
+
+test("concurrent lookups share one catalog request", async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let calls = 0
+  const h = {
+    catalogGpus: async () => {
+      calls++
+      await gate
+      return [{ id: "x", pool: "AMPERE_16", price: { serverless: 0.6 } }]
+    },
+  }
+  const catalog = new RunpodPriceCatalog(h, new FakeClock())
+  const a = catalog.rate("AMPERE_16")
+  const b = catalog.rate("AMPERE_48")
+  release()
+  assert.equal((await a).ratePerHour, 0.6)
+  assert.equal((await b).source, "fallback") // AMPERE_48 is not in this live catalog
+  assert.equal(calls, 1)
+})
+
+test("a failed lookup is retried after a minute, not after the full TTL", async () => {
+  const clock = new FakeClock()
+  let fail = true
+  let calls = 0
+  const h = {
+    catalogGpus: async () => {
+      calls++
+      if (fail) throw new Error("blip")
+      return [{ id: "x", pool: "AMPERE_16", price: { serverless: 0.6 } }]
+    },
+  }
+  const catalog = new RunpodPriceCatalog(h, clock)
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback")
+  fail = false
+  await clock.advance(30_000)
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback") // the failure is remembered briefly, not hammered
+  assert.equal(calls, 1)
+  await clock.advance(31_000)
+  assert.deepEqual(await catalog.rate("AMPERE_16"), { ratePerHour: 0.6, source: "catalog", vramGb: POOLS.AMPERE_16.vramGb, label: POOLS.AMPERE_16.label })
+  assert.equal(calls, 2)
+})
+
+test("a zero live price is ignored in favour of the static table; the pool table fixes VRAM", async () => {
+  const catalog = new RunpodPriceCatalog(
+    http([
+      { id: "a", pool: "AMPERE_16", price: { serverless: 0 } },
+      { id: "b", pool: "AMPERE_48", memory: 49152, price: { serverless: 1.3 } },
+    ]),
+    new FakeClock(),
+  )
+  assert.equal((await catalog.rate("AMPERE_16")).source, "fallback")
+  assert.equal((await catalog.rate("AMPERE_48")).vramGb, 48)
+})

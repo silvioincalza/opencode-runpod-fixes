@@ -25,6 +25,7 @@ class FakeHttp implements RunpodHttpLike {
   logs = ""
   chatError: Error | null = null
   deleteError: Error | null = null
+  lastChat: { body: unknown; signal: AbortSignal } | null = null
   openaiBaseURL(id: string) { return `https://api.runpod.ai/v2/${id}/openai/v1` }
   async listEndpoints() { this.calls.push("list"); return this.endpoints }
   async createEndpoint(body: Parameters<RunpodHttpLike["createEndpoint"]>[0]) { this.calls.push(`create:${JSON.stringify(body)}`); return { id: "ep9", name: body.name } }
@@ -36,7 +37,7 @@ class FakeHttp implements RunpodHttpLike {
   async catalogGpus() { return [] }
   async billedUsd() { return 0.5 }
   async health() { return { jobs: { completed: 0, failed: 0, inProgress: 0, inQueue: 0, retried: 0 }, workers: { idle: 1, initializing: 2, ready: 0, running: 3, throttled: 4 } } }
-  async chatCompletion(id: string) { this.calls.push(`chat:${id}`); if (this.chatError) throw this.chatError; return {} }
+  async chatCompletion(id: string, body: unknown, signal: AbortSignal) { this.calls.push(`chat:${id}`); this.lastChat = { body, signal }; if (this.chatError) throw this.chatError; return {} }
 }
 
 test("toCreateBody maps the spec and appends markers after user env and secrets", () => {
@@ -114,4 +115,37 @@ test("diagnostics returns the last 40 log lines of an unhealthy worker, or null"
   assert.equal(tail?.split("\n").length, 40)
   assert.ok(tail?.startsWith("line 11"))
   assert.ok(tail?.endsWith("line 50"))
+})
+
+test("warmup posts a one-token ping for the served model name, forwards the abort signal, and treats 408 as transient", async () => {
+  const http = new FakeHttp()
+  const provider = new RunpodComputeProvider(http)
+  const controller = new AbortController()
+  await provider.warmup("ep1", "m", controller.signal)
+  assert.deepEqual(http.lastChat?.body, { model: "m", messages: [{ role: "user", content: "ping" }], max_tokens: 1, stream: false })
+  assert.equal(http.lastChat?.signal, controller.signal)
+  http.chatError = new RunpodError(408, "Request Timeout", null, "POST")
+  await assert.rejects(provider.warmup("ep1", "m", controller.signal), (e: unknown) => e instanceof ComputeError && e.kind === "transient" && e.status === 408)
+})
+
+test("create sends exactly toCreateBody(spec); an empty minCudaVersion is omitted", async () => {
+  const http = new FakeHttp()
+  await new RunpodComputeProvider(http).create(spec)
+  assert.deepEqual(http.calls, [`create:${JSON.stringify(toCreateBody(spec))}`])
+  const body = toCreateBody({ ...spec, gpu: { ...spec.gpu, minCudaVersion: "" } })
+  assert.equal("minCudaVersion" in body.gpu, false)
+})
+
+test("diagnostics is best effort: log failures and empty logs yield null; CRLF logs are normalised", async () => {
+  const http = new FakeHttp()
+  const provider = new RunpodComputeProvider(http)
+  http.workers = [{ id: "w2", status: "UNHEALTHY" }]
+  http.logs = "  \n "
+  assert.equal(await provider.diagnostics("ep1"), null)
+  http.logs = "a\r\nb\r\n"
+  assert.equal(await provider.diagnostics("ep1"), "a\nb")
+  http.workerLogs = async () => {
+    throw new Error("gone")
+  }
+  assert.equal(await provider.diagnostics("ep1"), null)
 })

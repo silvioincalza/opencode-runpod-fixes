@@ -15,7 +15,7 @@ export function toCreateBody(spec: EndpointSpec): CreateEndpointRequest {
     name: spec.name,
     type: "QUEUE",
     scaling: { type: "QUEUE_DELAY", queueDelay: 1 },
-    gpu: { pools: [spec.gpu.pool], count: spec.gpu.count, minCudaVersion: spec.gpu.minCudaVersion },
+    gpu: { pools: [spec.gpu.pool], count: spec.gpu.count },
     image: spec.recipe.image,
     env,
     disk: spec.recipe.diskGb,
@@ -23,6 +23,7 @@ export function toCreateBody(spec: EndpointSpec): CreateEndpointRequest {
     timeout: spec.executionTimeoutSec * 1000,
     flashboot: spec.flashboot ? "FLASHBOOT" : "OFF",
   }
+  if (spec.gpu.minCudaVersion) body.gpu.minCudaVersion = spec.gpu.minCudaVersion
   if (spec.dataCenterIds.length > 0) body.dataCenterIds = [...spec.dataCenterIds]
   return body
 }
@@ -79,11 +80,15 @@ export class RunpodComputeProvider implements ComputeProviderPort {
   }
 
   async diagnostics(id: string): Promise<string | null> {
-    const workers = await this.http.listWorkers(id)
-    const unhealthy = workers.find((w) => w.status.toUpperCase() === "UNHEALTHY")
-    if (!unhealthy) return null
-    const text = await this.http.workerLogs(id, unhealthy.id)
-    return text.trim().split("\n").slice(-LOG_TAIL_LINES).join("\n")
+    try {
+      const workers = await this.http.listWorkers(id)
+      const unhealthy = workers.find((w) => w.status.toUpperCase() === "UNHEALTHY")
+      if (!unhealthy) return null
+      const text = (await this.http.workerLogs(id, unhealthy.id)).replace(/\r\n?/g, "\n").trim()
+      return text ? text.split("\n").slice(-LOG_TAIL_LINES).join("\n") : null
+    } catch {
+      return null // best effort: the caller is already reporting a failed cold start
+    }
   }
 
   billedUsd(id: string): Promise<number | null> {

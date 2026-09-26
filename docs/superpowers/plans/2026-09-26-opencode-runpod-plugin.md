@@ -18,7 +18,7 @@
 - Dependency rule (enforced by `test/architecture.test.ts`): `src/core/**` imports only `src/core/**` and `node:*`; `src/adapters/driven/<name>/**` imports `src/core/**`, its own folder, `node:*`, npm — never driving code or another driven adapter; `src/adapters/driving/**` imports `src/core/**`, `src/adapters/driving/**`, `node:*`, npm; only `src/adapters/driving/opencode/plugin.ts` (composition root) may import `src/adapters/driven/**`.
 - Runtime dependencies: `@opencode/plugin`, `zod` only. `@opentui/core`, `@opentui/solid`, `solid-js` are peerDependencies (host-provided) and devDependencies (types). No RunPod SDK.
 - RunPod REST v2 base `https://api.runpod.io/v2`; runtime base `https://api.runpod.ai/v2`; header `Authorization: Bearer <key>`. Endpoint names `oc-runpod-<modelID>`; env markers `OPENCODE_RUNPOD=1`, `OPENCODE_RUNPOD_HASH=<hash>`.
-- Defaults (spec §4): `confirm true`, `confirmTimeoutSec 120`, `idleTimeout 120`, `workersMax 1`, `executionTimeoutSec 600`, `coldStartTimeoutSec 600`, `deleteOnExit true`, `adoptExisting true`, `minCudaVersion "12.8"`, `workerImage "runpod/worker-v1-vllm:v2.27.2"`, `flashboot true`.
+- Defaults (spec §4): `confirm true`, `confirmTimeoutSec 120`, `idleTimeout 120`, `workersMax 1`, `executionTimeoutSec 600`, `coldStartTimeoutSec 600`, `deleteOnExit false` (zero-worker endpoints cost $0; they are re-adopted next start), `adoptExisting true`, `minCudaVersion "12.8"`, `workerImage "runpod/worker-v1-vllm:v2.27.2"`, `flashboot true`.
 - Provider id `runpod`, package `@opencode/ai/providers/openai-compatible`, placeholder baseURL `https://api.runpod.ai/v2/pending/openai/v1`, request timeouts 600000 ms.
 - Secrets (RunPod key, HF token) live only in adapters; never in `Settings`, logs, toasts, storage, RPC events, or the spec hash.
 - Commit messages: conventional prefix, no AI attribution trailers (user rule).
@@ -219,7 +219,8 @@ function walk(dir: string): string[] {
 
 function importsOf(file: string): string[] {
   const specs: string[] = []
-  for (const match of readFileSync(file, "utf8").matchAll(/(?:from|import)\s+"([^"]+)"/g)) specs.push(match[1]!)
+  // matches `from "x"`, `from 'x'`, `import "x"` and dynamic `import("x")`
+  for (const match of readFileSync(file, "utf8").matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/g)) specs.push(match[1]!)
   return specs
 }
 
@@ -529,39 +530,146 @@ git commit -m "chore: scaffold opencode-runpod with hexagonal layout, domain typ
 
 ---
 
-### Task 2: Domain pricing math and spend meter
+
+### Task 2: Domain — pricing math, spend meter, model overrides, provision proposals
 
 **Files:**
-- Create: `src/core/domain/quote.ts`, `src/core/domain/spend-meter.ts`
-- Test: `test/domain-quote.test.ts`
+- Modify: `src/core/domain/model.ts` (add `idleTimeout`, `MODEL_ID_PATTERN`, `ModelOverrides`, `idleTimeoutFor`, `applyOverrides`, `deriveModelID`)
+- Modify: `src/core/domain/endpoint.ts` (`buildEndpointSpec` uses the per-model idle timeout)
+- Modify: `test/domain-endpoint.test.ts` (model literal gains `idleTimeout`; one new assertion)
+- Create: `src/core/domain/quote.ts`, `src/core/domain/spend-meter.ts`, `src/core/domain/provision.ts`
+- Test: `test/domain-model.test.ts`, `test/domain-quote.test.ts`, `test/domain-provision.test.ts`
 
 **Interfaces:**
-- Produces: `interface PoolRate { ratePerHour: number; source: "catalog" | "fallback"; vramGb: number | null; label: string }`, `interface Quote { modelID; hf; gpu; gpuLabel; gpuCount; ratePerHour; rateSource; weightsGb: number | null; estColdStartSec; idleTimeout; idleWindowUsd; warnings: string[]; blocked: string | null }`, `DEFAULT_WEIGHTS_GB = 60`, `estimateColdStartSec(weightsGb)`, `idleWindowUsd(ratePerHour, idleTimeoutSec)`, `buildQuote({ model, settings, rate, weightsGb })`, `class SpendMeter { constructor(now: () => number); start(ratePerHour, at?); stop(at?); usd(at?); readonly running }`.
+- Consumes: `ModelConfig`, `Settings`, `findModel` (Task 1).
+- Produces (`model.ts`): `ModelConfig.idleTimeout: number | null`; `MODEL_ID_PATTERN`; `type ModelOverrides = Partial<Omit<ModelConfig, "id">>`; `idleTimeoutFor(model, settings): number`; `applyOverrides(model, overrides): ModelConfig`; `deriveModelID(hf): string`.
+- Produces (`quote.ts`): `interface PoolRate { ratePerHour; source: "catalog" | "fallback"; vramGb: number | null; label }`, `interface Quote { modelID; hf; gpu; gpuLabel; gpuCount; ratePerHour; rateSource; weightsGb; estColdStartSec; idleTimeout; idleWindowUsd; warnings; blocked }`, `DEFAULT_WEIGHTS_GB = 60`, `FIT_FACTOR = 0.85`, `fitsPool(weightsGb, vramGb, gpuCount): boolean | null`, `estimateColdStartSec`, `idleWindowUsd`, `buildQuote({ model, settings, rate, weightsGb })`.
+- Produces (`provision.ts`): `interface GpuOption { pool; label; ratePerHour; rateSource; vramGb; fits: boolean | null; estColdStartSec; current }`, `interface ProvisionProposal { quote; gpuOptions; idleTimeoutChoices }`, `interface ProvisionOverrides { gpu?; idleTimeout? }`, `type ProvisionDecision = { accepted: false } | { accepted: true; overrides: ProvisionOverrides }`, `IDLE_TIMEOUT_CHOICES`, `interface PoolPricing { pool; rate: PoolRate }`, `buildGpuOptions(model, pricing, weightsGb)`, `buildProposal({ quote, model, pricing, weightsGb })`, `gpuVariantsFor(model, pricing): string[]`.
+- Produces (`spend-meter.ts`): `class SpendMeter { constructor(now); start(ratePerHour, at?); stop(at?); usd(at?); readonly running }`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Extend `src/core/domain/model.ts`**
+
+Add the `idleTimeout` field to `ModelConfig` (after `weightsGb`) and append the helpers:
+```ts
+  weightsGb: number | null
+  /** Per-model idle window in seconds; null → Settings.idleTimeout. */
+  idleTimeout: number | null
+  env: Record<string, string>
+}
+```
+```ts
+export const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,62}$/
+
+/** Everything but the id may be changed at runtime (dialog, variants, /runpod-set). */
+export type ModelOverrides = Partial<Omit<ModelConfig, "id">>
+
+export function idleTimeoutFor(model: ModelConfig, settings: Settings): number {
+  return model.idleTimeout ?? settings.idleTimeout
+}
+
+/** Returns a new config; `undefined` values mean "not overridden"; `env` is copied. */
+export function applyOverrides(model: ModelConfig, overrides: ModelOverrides): ModelConfig {
+  const next: Record<string, unknown> = { ...model }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) continue
+    next[key] = key === "env" ? { ...(value as Record<string, string>) } : value
+  }
+  return next as unknown as ModelConfig
+}
+
+/** "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8" → "qwen3-coder-30b-a3b-instruct-fp8" */
+export function deriveModelID(hf: string): string {
+  const name = hf.split("/").pop() ?? hf
+  const id = name
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 63)
+    .replace(/[-._]+$/, "")
+  if (!MODEL_ID_PATTERN.test(id)) throw new Error(`cannot derive a model id from "${hf}"`)
+  return id
+}
+```
+
+- [ ] **Step 2: Use the per-model idle timeout in `src/core/domain/endpoint.ts`**
+
+Change the import and the `workers` line of `buildEndpointSpec`:
+```ts
+import { idleTimeoutFor, type ModelConfig, type Settings } from "./model.ts"
+```
+```ts
+    workers: { min: 0, max: settings.workersMax, idleTimeoutSec: idleTimeoutFor(model, settings) },
+```
+
+- [ ] **Step 3: Update `test/domain-endpoint.test.ts`**
+
+Add `idleTimeout: null,` to the `model` literal (after `weightsGb: null,`) and add this assertion at the end of the `buildEndpointSpec` test:
+```ts
+  assert.equal(buildEndpointSpec({ ...model, idleTimeout: 45 }, settings, recipe).workers.idleTimeoutSec, 45)
+```
+
+- [ ] **Step 4: Write the failing tests**
+
+`test/domain-model.test.ts`:
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { applyOverrides, deriveModelID, idleTimeoutFor, type ModelConfig, type Settings } from "../src/core/domain/model.ts"
+
+const model: ModelConfig = { id: "m", name: "M", hf: "Qwen/Qwen3-8B", gpu: "AMPERE_48", gpuCount: 1, context: 32768, output: 8192, tools: true, family: null, toolParser: undefined, reasoningParser: undefined, quantization: null, weightsGb: null, idleTimeout: null, env: { A: "1" } }
+const settings: Settings = { confirm: true, confirmTimeoutSec: 120, idleTimeout: 120, workersMax: 1, executionTimeoutSec: 600, coldStartTimeoutSec: 600, deleteOnExit: true, adoptExisting: true, maxHourlyRate: null, dataCenterIds: [], minCudaVersion: "12.8", workerImage: "img", flashboot: true, models: [model] }
+
+test("idleTimeoutFor prefers the per-model value", () => {
+  assert.equal(idleTimeoutFor(model, settings), 120)
+  assert.equal(idleTimeoutFor({ ...model, idleTimeout: 30 }, settings), 30)
+})
+
+test("applyOverrides returns a new config, skips undefined, copies env", () => {
+  const next = applyOverrides(model, { gpu: "AMPERE_80", toolParser: null, weightsGb: undefined, env: { B: "2" } })
+  assert.equal(next.gpu, "AMPERE_80")
+  assert.equal(next.toolParser, null)
+  assert.equal(next.weightsGb, null)
+  assert.deepEqual(next.env, { B: "2" })
+  assert.deepEqual(model.env, { A: "1" })
+  assert.equal(model.gpu, "AMPERE_48")
+  assert.equal(applyOverrides(model, {}).id, "m")
+})
+
+test("deriveModelID lowercases the repo name and normalises separators", () => {
+  assert.equal(deriveModelID("Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"), "qwen3-coder-30b-a3b-instruct-fp8")
+  assert.equal(deriveModelID("huihui-ai/Huihui-Qwen3.8-27B-abliterated"), "huihui-qwen3.8-27b-abliterated")
+  assert.equal(deriveModelID("org/__Weird Name__"), "weird-name")
+  assert.throws(() => deriveModelID("org/___"), /cannot derive a model id/)
+})
+```
 
 `test/domain-quote.test.ts`:
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { DEFAULT_WEIGHTS_GB, buildQuote, estimateColdStartSec, idleWindowUsd, type PoolRate } from "../src/core/domain/quote.ts"
+import { DEFAULT_WEIGHTS_GB, buildQuote, estimateColdStartSec, fitsPool, idleWindowUsd, type PoolRate } from "../src/core/domain/quote.ts"
 import { SpendMeter } from "../src/core/domain/spend-meter.ts"
 import type { ModelConfig, Settings } from "../src/core/domain/model.ts"
 
-const model: ModelConfig = { id: "m", name: "M", hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", gpuCount: 2, context: 65536, output: 8192, tools: true, family: null, toolParser: undefined, reasoningParser: undefined, quantization: "fp8", weightsGb: null, env: {} }
+const model: ModelConfig = { id: "m", name: "M", hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", gpuCount: 2, context: 65536, output: 8192, tools: true, family: null, toolParser: undefined, reasoningParser: undefined, quantization: "fp8", weightsGb: null, idleTimeout: null, env: {} }
 const settings: Settings = { confirm: true, confirmTimeoutSec: 120, idleTimeout: 120, workersMax: 1, executionTimeoutSec: 600, coldStartTimeoutSec: 600, deleteOnExit: true, adoptExisting: true, maxHourlyRate: null, dataCenterIds: [], minCudaVersion: "12.8", workerImage: "img", flashboot: true, models: [model] }
 const catalogRate: PoolRate = { ratePerHour: 1.3, source: "catalog", vramGb: 48, label: "A6000/A40 48GB" }
 const fallbackRate: PoolRate = { ratePerHour: 1.22, source: "fallback", vramGb: 48, label: "A6000/A40 48GB" }
 
-test("cold start estimate and idle window math", () => {
+test("cold start estimate, idle window math and fit check", () => {
   assert.equal(estimateColdStartSec(null), 180)
   assert.equal(estimateColdStartSec(30), 45 + 105)
   assert.equal(idleWindowUsd(1.2, 120), 0.04)
   assert.equal(DEFAULT_WEIGHTS_GB, 60)
+  assert.equal(fitsPool(31.6, 48, 1), true)
+  assert.equal(fitsPool(45, 48, 1), false)
+  assert.equal(fitsPool(45, 48, 2), true)
+  assert.equal(fitsPool(null, 48, 1), null)
+  assert.equal(fitsPool(10, null, 1), null)
 })
 
-test("buildQuote multiplies by gpuCount and warns on fallback pricing", () => {
-  const q = buildQuote({ model, settings, rate: fallbackRate, weightsGb: 31.6 })
+test("buildQuote multiplies by gpuCount, uses the per-model idle timeout and warns on fallback pricing", () => {
+  const q = buildQuote({ model: { ...model, idleTimeout: 60 }, settings, rate: fallbackRate, weightsGb: 31.6 })
   assert.equal(q.modelID, "m")
   assert.equal(q.hf, model.hf)
   assert.equal(q.gpuLabel, "A6000/A40 48GB")
@@ -570,21 +678,22 @@ test("buildQuote multiplies by gpuCount and warns on fallback pricing", () => {
   assert.equal(q.rateSource, "fallback")
   assert.equal(q.weightsGb, 31.6)
   assert.equal(q.estColdStartSec, estimateColdStartSec(31.6))
-  assert.equal(q.idleTimeout, 120)
-  assert.equal(q.idleWindowUsd, idleWindowUsd(2.44, 120))
+  assert.equal(q.idleTimeout, 60)
+  assert.equal(q.idleWindowUsd, idleWindowUsd(2.44, 60))
   assert.equal(q.blocked, null)
   assert.ok(q.warnings.some((w) => /static/.test(w)))
+  assert.equal(buildQuote({ model, settings, rate: fallbackRate, weightsGb: 31.6 }).idleTimeout, 120)
 })
 
-test("buildQuote warns when weights may not fit, unknown size, and blocks above maxHourlyRate or unknown pool", () => {
+test("buildQuote warns when weights may not fit or size is unknown, and blocks above maxHourlyRate or without a price", () => {
   const tight = buildQuote({ model: { ...model, gpuCount: 1 }, settings: { ...settings, maxHourlyRate: 1.0 }, rate: catalogRate, weightsGb: 45 })
   assert.ok(tight.warnings.some((w) => /may not fit 48 GB/.test(w)))
   assert.match(tight.blocked ?? "", /\$1\.30\/h exceeds options\.maxHourlyRate \$1\.00/)
   const unknownSize = buildQuote({ model, settings, rate: catalogRate, weightsGb: null })
   assert.ok(unknownSize.warnings.some((w) => /size unknown/.test(w)))
   assert.equal(unknownSize.blocked, null)
-  const unknownPool = buildQuote({ model, settings, rate: { ratePerHour: 0, source: "fallback", vramGb: null, label: "NOPE" }, weightsGb: 10 })
-  assert.match(unknownPool.blocked ?? "", /no price known for GPU pool "AMPERE_48"/)
+  const unpriced = buildQuote({ model, settings, rate: { ratePerHour: 0, source: "fallback", vramGb: null, label: "AMPERE_48" }, weightsGb: 10 })
+  assert.match(unpriced.blocked ?? "", /no price known for GPU pool "AMPERE_48"/)
 })
 
 test("SpendMeter accumulates only while running and can be stopped retroactively", () => {
@@ -595,7 +704,7 @@ test("SpendMeter accumulates only while running and can be stopped retroactively
   now = 10_000
   assert.equal(meter.running, true)
   assert.ok(Math.abs(meter.usd() - 0.01) < 1e-9)
-  meter.stop(5_000) // scaled down at t=5s even though noticed at t=10s
+  meter.stop(5_000)
   assert.equal(meter.running, false)
   assert.ok(Math.abs(meter.usd() - 0.005) < 1e-9)
   now = 20_000
@@ -607,15 +716,64 @@ test("SpendMeter accumulates only while running and can be stopped retroactively
 })
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+`test/domain-provision.test.ts`:
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import type { ModelConfig } from "../src/core/domain/model.ts"
+import { IDLE_TIMEOUT_CHOICES, buildGpuOptions, buildProposal, gpuVariantsFor, type PoolPricing } from "../src/core/domain/provision.ts"
+import { buildQuote, type PoolRate } from "../src/core/domain/quote.ts"
+import type { Settings } from "../src/core/domain/model.ts"
+
+const model: ModelConfig = { id: "m", name: "M", hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", gpuCount: 1, context: 65536, output: 8192, tools: true, family: null, toolParser: undefined, reasoningParser: undefined, quantization: "fp8", weightsGb: null, idleTimeout: null, env: {} }
+const settings: Settings = { confirm: true, confirmTimeoutSec: 120, idleTimeout: 120, workersMax: 1, executionTimeoutSec: 600, coldStartTimeoutSec: 600, deleteOnExit: true, adoptExisting: true, maxHourlyRate: null, dataCenterIds: [], minCudaVersion: "12.8", workerImage: "img", flashboot: true, models: [model] }
+const rate = (ratePerHour: number, vramGb: number | null, label: string): PoolRate => ({ ratePerHour, source: "catalog", vramGb, label })
+const pricing: PoolPricing[] = [
+  { pool: "AMPERE_80", rate: rate(2.72, 80, "A100 80GB") },
+  { pool: "AMPERE_16", rate: rate(0.58, 16, "A4000/A4500 16GB") },
+  { pool: "AMPERE_48", rate: rate(1.22, 48, "A6000/A40 48GB") },
+  { pool: "UNPRICED", rate: { ratePerHour: 0, source: "fallback", vramGb: null, label: "UNPRICED" } },
+]
+
+test("buildGpuOptions prices every pool for the model, flags fit and current, sorted by price, skipping unpriced pools", () => {
+  const options = buildGpuOptions({ ...model, gpuCount: 2 }, pricing, 31.6)
+  assert.deepEqual(options.map((o) => o.pool), ["AMPERE_16", "AMPERE_48", "AMPERE_80"])
+  assert.deepEqual(options.map((o) => o.ratePerHour), [1.16, 2.44, 5.44])
+  assert.deepEqual(options.map((o) => o.fits), [false, true, true])
+  assert.deepEqual(options.map((o) => o.current), [false, true, false])
+  assert.equal(options[1]!.label, "A6000/A40 48GB")
+  assert.equal(options[1]!.vramGb, 48)
+  assert.equal(options[1]!.rateSource, "catalog")
+  assert.equal(options[1]!.estColdStartSec, 45 + Math.round(31.6 * 3.5))
+  assert.deepEqual(buildGpuOptions(model, pricing, null).map((o) => o.fits), [null, null, null])
+})
+
+test("buildProposal bundles the quote, the options and the idle choices", () => {
+  const quote = buildQuote({ model, settings, rate: pricing[2]!.rate, weightsGb: 31.6 })
+  const proposal = buildProposal({ quote, model, pricing, weightsGb: 31.6 })
+  assert.equal(proposal.quote, quote)
+  assert.equal(proposal.gpuOptions.length, 3)
+  assert.deepEqual(proposal.idleTimeoutChoices, [...IDLE_TIMEOUT_CHOICES])
+  assert.deepEqual(IDLE_TIMEOUT_CHOICES, [30, 60, 120, 300, 600, 1800])
+})
+
+test("gpuVariantsFor lists pools with at least the current pool's VRAM, cheapest first", () => {
+  assert.deepEqual(gpuVariantsFor(model, pricing), ["AMPERE_48", "AMPERE_80"])
+  assert.deepEqual(gpuVariantsFor({ ...model, gpu: "AMPERE_16" }, pricing), ["AMPERE_16", "AMPERE_48", "AMPERE_80"])
+  assert.deepEqual(gpuVariantsFor({ ...model, gpu: "AMPERE_80" }, pricing), ["AMPERE_80"])
+  assert.deepEqual(gpuVariantsFor({ ...model, gpu: "UNKNOWN" }, pricing), ["AMPERE_16", "AMPERE_48", "AMPERE_80"])
+})
+```
+
+- [ ] **Step 5: Run the tests to verify they fail**
 
 Run: `npm test`
-Expected: FAIL — cannot find `src/core/domain/quote.ts`.
+Expected: FAIL — `quote.ts`, `spend-meter.ts`, `provision.ts` not found; `domain-model.test.ts` fails on missing exports; `tsc` would also fail on the `idleTimeout` literal until Step 1 lands.
 
-- [ ] **Step 3: Implement `src/core/domain/quote.ts`**
+- [ ] **Step 6: Implement `src/core/domain/quote.ts`**
 
 ```ts
-import type { ModelConfig, Settings } from "./model.ts"
+import { idleTimeoutFor, type ModelConfig, type Settings } from "./model.ts"
 
 export interface PoolRate {
   /** $/h for ONE GPU of the pool. */
@@ -644,6 +802,8 @@ export interface Quote {
 }
 
 export const DEFAULT_WEIGHTS_GB = 60
+/** Fraction of VRAM the weights may occupy; the rest is KV cache and activations. */
+export const FIT_FACTOR = 0.85
 
 /** Heuristic: ~45 s container/engine start + ~3.5 s per GB pulled and loaded. Unknown size → 3 min. */
 export function estimateColdStartSec(weightsGb: number | null): number {
@@ -654,15 +814,22 @@ export function idleWindowUsd(ratePerHour: number, idleTimeoutSec: number): numb
   return Math.round(((ratePerHour * idleTimeoutSec) / 3600) * 1e6) / 1e6
 }
 
+/** true/false when both sizes are known, null otherwise. */
+export function fitsPool(weightsGb: number | null, vramGb: number | null, gpuCount: number): boolean | null {
+  if (weightsGb === null || vramGb === null) return null
+  return weightsGb <= vramGb * gpuCount * FIT_FACTOR
+}
+
 export function buildQuote(input: { model: ModelConfig; settings: Settings; rate: PoolRate; weightsGb: number | null }): Quote {
   const { model, settings, rate, weightsGb } = input
   const ratePerHour = Math.round(rate.ratePerHour * model.gpuCount * 1e4) / 1e4
+  const idleTimeout = idleTimeoutFor(model, settings)
   const warnings: string[] = []
   let blocked: string | null = null
   if (rate.source === "fallback") warnings.push("price from the static table (live catalog unavailable)")
   if (weightsGb === null) warnings.push("weights size unknown; the cold start estimate is a guess")
-  if (weightsGb !== null && rate.vramGb !== null && weightsGb > rate.vramGb * model.gpuCount * 0.85) {
-    warnings.push(`weights ≈${weightsGb} GB may not fit ${rate.vramGb * model.gpuCount} GB of VRAM`)
+  if (fitsPool(weightsGb, rate.vramGb, model.gpuCount) === false) {
+    warnings.push(`weights ≈${weightsGb} GB may not fit ${rate.vramGb! * model.gpuCount} GB of VRAM`)
   }
   if (rate.ratePerHour === 0) blocked = `no price known for GPU pool "${model.gpu}"`
   if (settings.maxHourlyRate !== null && ratePerHour > settings.maxHourlyRate) {
@@ -678,15 +845,15 @@ export function buildQuote(input: { model: ModelConfig; settings: Settings; rate
     rateSource: rate.source,
     weightsGb,
     estColdStartSec: estimateColdStartSec(weightsGb),
-    idleTimeout: settings.idleTimeout,
-    idleWindowUsd: idleWindowUsd(ratePerHour, settings.idleTimeout),
+    idleTimeout,
+    idleWindowUsd: idleWindowUsd(ratePerHour, idleTimeout),
     warnings,
     blocked,
   }
 }
 ```
 
-- [ ] **Step 4: Implement `src/core/domain/spend-meter.ts`**
+- [ ] **Step 7: Implement `src/core/domain/spend-meter.ts`**
 
 ```ts
 /** Accumulates $ while a worker is believed to be running. */
@@ -723,33 +890,111 @@ export class SpendMeter {
 }
 ```
 
-- [ ] **Step 5: Run tests and typecheck**
+- [ ] **Step 8: Implement `src/core/domain/provision.ts`**
+
+```ts
+import type { ModelConfig } from "./model.ts"
+import { estimateColdStartSec, fitsPool, type PoolRate, type Quote } from "./quote.ts"
+
+export interface GpuOption {
+  pool: string
+  label: string
+  /** $/h for the whole worker (pool rate × gpuCount). */
+  ratePerHour: number
+  rateSource: "catalog" | "fallback"
+  vramGb: number | null
+  fits: boolean | null
+  estColdStartSec: number
+  current: boolean
+}
+
+/** What the user sees before an endpoint is created: the quote plus every alternative. */
+export interface ProvisionProposal {
+  quote: Quote
+  gpuOptions: GpuOption[]
+  idleTimeoutChoices: number[]
+}
+
+export interface ProvisionOverrides {
+  gpu?: string
+  idleTimeout?: number
+}
+
+export type ProvisionDecision = { accepted: false } | { accepted: true; overrides: ProvisionOverrides }
+
+export const IDLE_TIMEOUT_CHOICES: readonly number[] = [30, 60, 120, 300, 600, 1800]
+
+export interface PoolPricing {
+  pool: string
+  rate: PoolRate
+}
+
+const byPrice = (a: { ratePerHour: number; pool: string }, b: { ratePerHour: number; pool: string }) =>
+  a.ratePerHour - b.ratePerHour || (a.pool < b.pool ? -1 : a.pool > b.pool ? 1 : 0)
+
+export function buildGpuOptions(model: ModelConfig, pricing: readonly PoolPricing[], weightsGb: number | null): GpuOption[] {
+  return pricing
+    .filter((p) => p.rate.ratePerHour > 0)
+    .map(({ pool, rate }) => ({
+      pool,
+      label: rate.label,
+      ratePerHour: Math.round(rate.ratePerHour * model.gpuCount * 1e4) / 1e4,
+      rateSource: rate.source,
+      vramGb: rate.vramGb,
+      fits: fitsPool(weightsGb, rate.vramGb, model.gpuCount),
+      estColdStartSec: estimateColdStartSec(weightsGb),
+      current: pool === model.gpu,
+    }))
+    .sort(byPrice)
+}
+
+export function buildProposal(input: { quote: Quote; model: ModelConfig; pricing: readonly PoolPricing[]; weightsGb: number | null }): ProvisionProposal {
+  return {
+    quote: input.quote,
+    gpuOptions: buildGpuOptions(input.model, input.pricing, input.weightsGb),
+    idleTimeoutChoices: [...IDLE_TIMEOUT_CHOICES],
+  }
+}
+
+/** Variant pools for the model picker: at least the current pool's VRAM (all pools when unknown), cheapest first. */
+export function gpuVariantsFor(model: ModelConfig, pricing: readonly PoolPricing[]): string[] {
+  const floor = pricing.find((p) => p.pool === model.gpu)?.rate.vramGb ?? null
+  return pricing
+    .filter((p) => p.rate.ratePerHour > 0 && (p.pool === model.gpu || floor === null || (p.rate.vramGb ?? 0) >= floor))
+    .map((p) => ({ pool: p.pool, ratePerHour: p.rate.ratePerHour }))
+    .sort(byPrice)
+    .map((p) => p.pool)
+}
+```
+
+- [ ] **Step 9: Run tests and typecheck**
 
 Run: `npm run check`
-Expected: pass.
+Expected: all pass (architecture test included — the new domain files import only `./model.ts` / `./quote.ts`).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/core/domain/quote.ts src/core/domain/spend-meter.ts test/domain-quote.test.ts
-git commit -m "feat(core): quote math and spend meter"
+git add src/core/domain test/domain-endpoint.test.ts test/domain-model.test.ts test/domain-quote.test.ts test/domain-provision.test.ts
+git commit -m "feat(core): quote math, spend meter, model overrides and provision proposals"
 ```
 
 ---
 
-### Task 3: Ports, test fakes, and `EndpointService.ensureReady`
+### Task 3: Ports, test fakes, and `EndpointService.ensureReady` (proposal → decision → overrides → create → warm)
 
 **Files:**
-- Create: `src/core/ports/compute-provider.ts`, `price-catalog.ts`, `worker-recipe.ts`, `weights-info.ts`, `state-store.ts`, `clock.ts`, `confirmation.ts`, `notifier.ts`, `logger.ts`
+- Create: `src/core/ports/compute-provider.ts`, `price-catalog.ts`, `worker-recipe.ts`, `weights-info.ts`, `state-store.ts`, `clock.ts`, `confirmation.ts`, `notifier.ts`, `logger.ts`, `catalog-publisher.ts`
+- Modify: `src/core/ports/driving.ts` (new signatures)
 - Create: `src/core/application/endpoint-service.ts` (delete `src/core/application/.gitkeep`)
-- Create: `test/fakes/clock.ts`, `store.ts`, `compute.ts`, `catalog.ts`, `weights.ts`, `recipe.ts`, `confirmation.ts`, `notifier.ts`, `logger.ts`, `fixtures.ts`
+- Create: `test/fakes/clock.ts`, `store.ts`, `compute.ts`, `catalog.ts`, `weights.ts`, `recipe.ts`, `confirmation.ts`, `notifier.ts`, `logger.ts`, `publisher.ts`, `fixtures.ts`
 - Test: `test/service-ensure-ready.test.ts`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1–2.
-- Produces (ports): see code below — exact names `ComputeProviderPort`, `RemoteEndpoint`, `HealthSnapshot`, `ComputeError` (`kind: "transient" | "fatal"`, `status: number | null`), `PriceCatalogPort`, `WorkerRecipePort`, `WeightsInfoPort`, `StateStorePort`, `ClockPort`, `ConfirmationPort`, `NotifierPort`, `LoggerPort`.
-- Produces (application): `interface ServicePorts { compute: ComputeProviderPort | null; catalog; weights; recipe; store; clock; confirmation; notifier; logger }`, `class EndpointService implements ModelRoutingPort { constructor(settings: Settings, ports: ServicePorts); ensureReady(modelID, opts?); phase(modelID): Phase }`, constants `IDLE_GRACE_MS = 15000`, `HEALTH_POLL_MS = 3000`, `WARMUP_RETRY_MS = 5000`. Storage keys `endpoints/<modelID>` (EndpointRecord) and `weights/<hf>` (number).
-- Produces (fakes): `FakeClock` (`now/sleep/setTimer/clearTimer/advance(ms)/pending`), `flush()`, `InMemoryStateStore` (`data` map), `FakeCompute` (`remote`, `created`, `calls`, `healthSnapshot`, `diagnosticsText`, `billed`, `failCreate`, `failDelete`, `finishWarmup()`, `failWarmup(err)`, `pendingWarmups`, URLs `https://compute.test/<id>/v1`), `FakeCatalog` (`rates`, `fail`, `calls`), `FakeWeights(value)`, `FakeRecipe`, `ScriptedConfirmation(answers)` (`asked`), `RecordingNotifier` (`events`, `notices`), `RecordingLogger` (`lines`), `sampleModel()`, `sampleSettings()`, `harness(settingsOverrides?, { answers?, weights?, compute? })`.
+- Consumes: Tasks 1–2 domain (`ModelConfig` incl. `idleTimeout`, `ModelOverrides`, `applyOverrides`, `idleTimeoutFor`, `buildEndpointSpec`, `EndpointRecord`, `Phase`, `StateEvent`, `Quote`, `PoolRate`, `buildQuote`, `DEFAULT_WEIGHTS_GB`, `SpendMeter`, `ProvisionProposal`, `ProvisionDecision`, `ProvisionOverrides`, `PoolPricing`, `buildProposal`, `gpuVariantsFor`).
+- Produces (ports, exact names): `ComputeProviderPort` (`list, create, scaleToZero, delete, health, warmup, diagnostics, setIdleTimeout, billedUsd, inferenceBaseURL`), `RemoteEndpoint`, `HealthSnapshot`, `ComputeError` (`kind: "transient" | "fatal"`, `status: number | null`); `PriceCatalogPort`; `WorkerRecipePort`; `WeightsInfoPort`; `StateStorePort` (`get, set, remove, keys(prefix)`); `ClockPort`; `ConfirmationPort.ask(proposal): Promise<ProvisionDecision>`; `NotifierPort`; `LoggerPort`; `PublishedModel { config; variants }`, `CatalogPublisherPort.publish(models)`; `ModelRoutingPort.ensureReady(modelID, opts?: { skipConfirm?; gpu? })`; `AddModelInput { hf; gpu?; overrides? }`; `OperationsPort` (`status, up, down, add, set, remove, models`); `LifecyclePort`.
+- Produces (application): `interface ServicePorts { compute: ComputeProviderPort | null; catalog; weights; recipe; store; clock; confirmation; notifier; publisher; logger }`; `class EndpointService implements ModelRoutingPort { constructor(settings, ports); ensureReady(modelID, opts?); phase(modelID) }` (the `gpu` option is accepted but acted on in Task 5); constants `IDLE_GRACE_MS = 15000`, `HEALTH_POLL_MS = 3000`, `WARMUP_RETRY_MS = 5000`; storage keys `endpoints/<id>`, `weights/<hf>`, `overrides/<id>`, `models/<id>` via `recordKey`, `weightsKey`, `overridesKey`, `modelKey`.
+- Produces (fakes): `FakeClock` (`now/sleep/setTimer/clearTimer/advance(ms)/pending`), `flush()`, `InMemoryStateStore` (`data`), `FakeCompute` (`remote, created, calls, healthSnapshot, diagnosticsText, billed, failCreate, failDelete, finishWarmup(), failWarmup(err), pendingWarmups`, URLs `https://compute.test/<id>/v1`), `FakeCatalog` (`rates, fail, calls`), `FakeWeights(value)`, `FakeRecipe`, `ScriptedConfirmation(decisions)` (`asked: ProvisionProposal[]`) + `accept(overrides?)` / `decline`, `RecordingNotifier` (`events, notices, phases`), `RecordingLogger` (`lines`), `FakePublisher` (`published: PublishedModel[][]`, `latest`), `sampleModel()`, `sampleSettings()`, `harness(settingsOverrides?, { answers?, weights?, compute? })`.
 
 - [ ] **Step 1: Create the port files**
 
@@ -796,6 +1041,8 @@ export interface ComputeProviderPort {
   warmup(id: string, modelID: string, signal: AbortSignal): Promise<void>
   /** Log tail of an unhealthy worker, or null when nothing useful is available. */
   diagnostics(id: string): Promise<string | null>
+  /** Changes the idle window of a live endpoint without recreating it. */
+  setIdleTimeout(id: string, seconds: number): Promise<void>
   billedUsd(id: string): Promise<number | null>
   inferenceBaseURL(id: string): string
 }
@@ -837,6 +1084,8 @@ export interface StateStorePort {
   get<T>(key: string): Promise<T | undefined>
   set(key: string, value: unknown): Promise<void>
   remove(key: string): Promise<void>
+  /** All stored keys starting with `prefix`, sorted. */
+  keys(prefix: string): Promise<string[]>
 }
 ```
 
@@ -852,11 +1101,11 @@ export interface ClockPort {
 
 `src/core/ports/confirmation.ts`:
 ```ts
-import type { Quote } from "../domain/quote.ts"
+import type { ProvisionDecision, ProvisionProposal } from "../domain/provision.ts"
 
 export interface ConfirmationPort {
-  /** Resolves true when the user accepts, false when declined or unanswered. */
-  ask(quote: Quote): Promise<boolean>
+  /** Shows the proposal to the user; resolves with their decision (declined when unanswered). */
+  ask(proposal: ProvisionProposal): Promise<ProvisionDecision>
 }
 ```
 
@@ -875,6 +1124,58 @@ export interface NotifierPort {
 export interface LoggerPort {
   info(message: string, extra?: Record<string, unknown>): void
   warn(message: string, extra?: Record<string, unknown>): void
+}
+```
+
+`src/core/ports/catalog-publisher.ts`:
+```ts
+import type { ModelConfig } from "../domain/model.ts"
+
+export interface PublishedModel {
+  config: ModelConfig
+  /** GPU pool ids offered as selectable variants of this model. */
+  variants: string[]
+}
+
+/** Receives the effective model list whenever it changes (host re-registers the provider). */
+export interface CatalogPublisherPort {
+  publish(models: readonly PublishedModel[]): Promise<void>
+}
+```
+
+Replace `src/core/ports/driving.ts`:
+```ts
+import type { StatusReport } from "../domain/events.ts"
+import type { ModelConfig, ModelOverrides } from "../domain/model.ts"
+
+/** Driving port used by the model.request hook: make the model reachable and return its inference base URL. */
+export interface ModelRoutingPort {
+  /** `gpu` is the pool id of the selected variant; when it differs from the effective pool it is applied as an override first. */
+  ensureReady(modelID: string, opts?: { skipConfirm?: boolean; gpu?: string }): Promise<string>
+}
+
+export interface AddModelInput {
+  hf: string
+  gpu?: string
+  overrides?: ModelOverrides
+}
+
+/** Driving port used by commands and RPC methods. */
+export interface OperationsPort {
+  status(): Promise<StatusReport>
+  up(modelID: string): Promise<string>
+  down(modelID?: string): Promise<string[]>
+  add(input: AddModelInput): Promise<ModelConfig>
+  set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig>
+  /** Runtime models are removed; static models have their overrides reset. */
+  remove(modelID: string): Promise<"removed" | "reset">
+  models(): readonly ModelConfig[]
+}
+
+/** Driving port used by the plugin lifecycle. */
+export interface LifecyclePort {
+  start(): Promise<void>
+  stop(budgetMs?: number): Promise<void>
 }
 ```
 
@@ -952,6 +1253,9 @@ export class InMemoryStateStore implements StateStorePort {
   async remove(key: string): Promise<void> {
     this.data.delete(key)
   }
+  async keys(prefix: string): Promise<string[]> {
+    return [...this.data.keys()].filter((k) => k.startsWith(prefix)).sort()
+  }
 }
 ```
 
@@ -1025,6 +1329,10 @@ export class FakeCompute implements ComputeProviderPort {
   async diagnostics(id: string): Promise<string | null> {
     this.calls.push(`diagnostics:${id}`)
     return this.diagnosticsText
+  }
+
+  async setIdleTimeout(id: string, seconds: number): Promise<void> {
+    this.calls.push(`setIdleTimeout:${id}:${seconds}`)
   }
 
   async billedUsd(): Promise<number | null> {
@@ -1116,19 +1424,22 @@ export class FakeRecipe implements WorkerRecipePort {
 
 `test/fakes/confirmation.ts`:
 ```ts
-import type { Quote } from "../../src/core/domain/quote.ts"
+import type { ProvisionDecision, ProvisionOverrides, ProvisionProposal } from "../../src/core/domain/provision.ts"
 import type { ConfirmationPort } from "../../src/core/ports/confirmation.ts"
+
+export const accept = (overrides: ProvisionOverrides = {}): ProvisionDecision => ({ accepted: true, overrides })
+export const decline: ProvisionDecision = { accepted: false }
 
 /** Answers in order; the last answer repeats. */
 export class ScriptedConfirmation implements ConfirmationPort {
-  answers: boolean[]
-  asked: Quote[] = []
-  constructor(answers: boolean[] = [true]) {
+  answers: ProvisionDecision[]
+  asked: ProvisionProposal[] = []
+  constructor(answers: ProvisionDecision[] = [accept()]) {
     this.answers = [...answers]
   }
-  async ask(quote: Quote): Promise<boolean> {
-    this.asked.push(quote)
-    return this.answers.length > 1 ? this.answers.shift()! : (this.answers[0] ?? true)
+  async ask(proposal: ProvisionProposal): Promise<ProvisionDecision> {
+    this.asked.push(proposal)
+    return this.answers.length > 1 ? this.answers.shift()! : (this.answers[0] ?? accept())
   }
 }
 ```
@@ -1168,16 +1479,33 @@ export class RecordingLogger implements LoggerPort {
 }
 ```
 
+`test/fakes/publisher.ts`:
+```ts
+import type { CatalogPublisherPort, PublishedModel } from "../../src/core/ports/catalog-publisher.ts"
+
+export class FakePublisher implements CatalogPublisherPort {
+  published: PublishedModel[][] = []
+  async publish(models: readonly PublishedModel[]): Promise<void> {
+    this.published.push(models.map((m) => ({ config: structuredClone(m.config), variants: [...m.variants] })))
+  }
+  get latest(): PublishedModel[] | undefined {
+    return this.published.at(-1)
+  }
+}
+```
+
 `test/fakes/fixtures.ts`:
 ```ts
 import { EndpointService, type ServicePorts } from "../../src/core/application/endpoint-service.ts"
 import type { ModelConfig, Settings } from "../../src/core/domain/model.ts"
+import type { ProvisionDecision } from "../../src/core/domain/provision.ts"
 import { FakeCatalog } from "./catalog.ts"
 import { FakeClock } from "./clock.ts"
 import { FakeCompute } from "./compute.ts"
-import { ScriptedConfirmation } from "./confirmation.ts"
+import { ScriptedConfirmation, accept } from "./confirmation.ts"
 import { RecordingLogger } from "./logger.ts"
 import { RecordingNotifier } from "./notifier.ts"
+import { FakePublisher } from "./publisher.ts"
 import { FakeRecipe } from "./recipe.ts"
 import { InMemoryStateStore } from "./store.ts"
 import { FakeWeights } from "./weights.ts"
@@ -1197,6 +1525,7 @@ export function sampleModel(overrides: Partial<ModelConfig> = {}): ModelConfig {
     reasoningParser: undefined,
     quantization: "fp8",
     weightsGb: null,
+    idleTimeout: null,
     env: {},
     ...overrides,
   }
@@ -1210,7 +1539,7 @@ export function sampleSettings(overrides: Partial<Settings> = {}): Settings {
     workersMax: 1,
     executionTimeoutSec: 600,
     coldStartTimeoutSec: 600,
-    deleteOnExit: true,
+    deleteOnExit: false,
     adoptExisting: true,
     maxHourlyRate: null,
     dataCenterIds: [],
@@ -1231,6 +1560,7 @@ export interface Harness {
   store: InMemoryStateStore
   confirmation: ScriptedConfirmation
   notifier: RecordingNotifier
+  publisher: FakePublisher
   logger: RecordingLogger
   settings: Settings
   service: EndpointService
@@ -1238,7 +1568,7 @@ export interface Harness {
 
 export function harness(
   settingsOverrides: Partial<Settings> = {},
-  opts: { answers?: boolean[]; weights?: number | null; compute?: boolean } = {},
+  opts: { answers?: ProvisionDecision[]; weights?: number | null; compute?: boolean } = {},
 ): Harness {
   const settings = sampleSettings(settingsOverrides)
   const clock = new FakeClock()
@@ -1247,8 +1577,9 @@ export function harness(
   const weights = new FakeWeights(opts.weights === undefined ? 31.6 : opts.weights)
   const recipe = new FakeRecipe()
   const store = new InMemoryStateStore()
-  const confirmation = new ScriptedConfirmation(opts.answers ?? [true])
+  const confirmation = new ScriptedConfirmation(opts.answers ?? [accept()])
   const notifier = new RecordingNotifier()
+  const publisher = new FakePublisher()
   const logger = new RecordingLogger()
   const ports: ServicePorts = {
     compute: opts.compute === false ? null : compute,
@@ -1259,9 +1590,10 @@ export function harness(
     clock,
     confirmation,
     notifier,
+    publisher,
     logger,
   }
-  return { clock, compute, catalog, weights, recipe, store, confirmation, notifier, logger, settings, service: new EndpointService(settings, ports) }
+  return { clock, compute, catalog, weights, recipe, store, confirmation, notifier, publisher, logger, settings, service: new EndpointService(settings, ports) }
 }
 ```
 
@@ -1273,19 +1605,25 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import type { EndpointRecord } from "../src/core/domain/endpoint.ts"
 import { flush } from "./fakes/clock.ts"
+import { accept, decline } from "./fakes/confirmation.ts"
 import { harness } from "./fakes/fixtures.ts"
 
-test("happy path: quote → confirm → create → warm → ready, returns the inference URL", async () => {
+test("happy path: quote → proposal → accept → create → warm → ready, returns the inference URL", async () => {
   const h = harness()
   const pending = h.service.ensureReady("m")
   await flush()
   assert.equal(h.service.phase("m"), "warming")
   assert.equal(h.confirmation.asked.length, 1)
-  const quote = h.confirmation.asked[0]!
-  assert.equal(quote.gpuLabel, "A6000/A40 48GB")
-  assert.equal(quote.ratePerHour, 1.22)
-  assert.equal(quote.rateSource, "catalog")
-  assert.equal(quote.weightsGb, 31.6)
+  const proposal = h.confirmation.asked[0]!
+  assert.equal(proposal.quote.gpuLabel, "A6000/A40 48GB")
+  assert.equal(proposal.quote.ratePerHour, 1.22)
+  assert.equal(proposal.quote.rateSource, "catalog")
+  assert.equal(proposal.quote.weightsGb, 31.6)
+  assert.equal(proposal.quote.idleTimeout, 120)
+  assert.deepEqual(proposal.gpuOptions.map((o) => o.pool), ["AMPERE_16", "AMPERE_48", "AMPERE_80"])
+  assert.deepEqual(proposal.gpuOptions.map((o) => o.fits), [false, true, true])
+  assert.deepEqual(proposal.gpuOptions.map((o) => o.current), [false, true, false])
+  assert.equal(proposal.idleTimeoutChoices.length, 6)
   assert.equal(h.compute.created.length, 1)
   const spec = h.compute.created[0]!
   assert.equal(spec.name, "oc-runpod-m")
@@ -1306,10 +1644,51 @@ test("happy path: quote → confirm → create → warm → ready, returns the i
   assert.equal(record?.hash, spec.hash)
   assert.equal(record?.modelID, "m")
   assert.equal(await h.store.get("weights/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"), 31.6)
+  assert.equal(h.publisher.published.length, 0) // nothing changed → no republish
+})
+
+test("accepting with overrides re-prices, provisions on the chosen pool, persists the overrides and republishes", async () => {
+  const h = harness({}, { answers: [accept({ gpu: "AMPERE_80", idleTimeout: 60 })] })
+  const pending = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.confirmation.asked.length, 1)
+  assert.equal(h.confirmation.asked[0]!.quote.ratePerHour, 1.22)
+  const spec = h.compute.created[0]!
+  assert.equal(spec.gpu.pool, "AMPERE_80")
+  assert.equal(spec.workers.idleTimeoutSec, 60)
+  assert.deepEqual(await h.store.get("overrides/m"), { gpu: "AMPERE_80", idleTimeout: 60 })
+  assert.deepEqual(h.publisher.latest?.map((m) => [m.config.id, m.config.gpu, m.variants]), [["m", "AMPERE_80", ["AMPERE_80"]]])
+  h.compute.finishWarmup()
+  await pending
+  assert.equal(h.notifier.events.at(-1)!.ratePerHour, 2.72)
+  assert.equal(h.notifier.events.at(-1)!.gpuLabel, "A100 80GB")
+})
+
+test("overrides equal to the current values are not persisted", async () => {
+  const h = harness({}, { answers: [accept({ gpu: "AMPERE_48", idleTimeout: 120 })] })
+  const pending = h.service.ensureReady("m")
+  await flush()
+  h.compute.finishWarmup()
+  await pending
+  assert.equal(await h.store.get("overrides/m"), undefined)
+  assert.equal(h.publisher.published.length, 0)
+})
+
+test("an override that breaks maxHourlyRate or names an unknown pool is refused before anything is persisted", async () => {
+  const capped = harness({ maxHourlyRate: 2.0 }, { answers: [accept({ gpu: "AMPERE_80" })] })
+  await assert.rejects(capped.service.ensureReady("m"), /refusing to provision m: \$2\.72\/h exceeds options\.maxHourlyRate \$2\.00/)
+  assert.equal(capped.compute.created.length, 0)
+  assert.equal(await capped.store.get("overrides/m"), undefined)
+  assert.equal(capped.service.phase("m"), "cold")
+  const unknown = harness({}, { answers: [accept({ gpu: "NOPE" })] })
+  await assert.rejects(unknown.service.ensureReady("m"), /unknown GPU pool "NOPE" \(known: AMPERE_16, AMPERE_48, AMPERE_80\)/)
+  assert.equal(await unknown.store.get("overrides/m"), undefined)
+  const badIdle = harness({}, { answers: [accept({ idleTimeout: 0 })] })
+  await assert.rejects(badIdle.service.ensureReady("m"), /idleTimeout must be an integer between 1 and 3600/)
 })
 
 test("declined confirmation: nothing created, phase back to cold, actionable error", async () => {
-  const h = harness({}, { answers: [false] })
+  const h = harness({}, { answers: [decline] })
   await assert.rejects(h.service.ensureReady("m"), /declined or not confirmed within 120s.*\/runpod-up m.*options\.confirm=false/s)
   assert.equal(h.compute.created.length, 0)
   assert.equal(h.service.phase("m"), "cold")
@@ -1376,7 +1755,7 @@ test("weights size is read from the store cache before asking the weights port",
   h.compute.finishWarmup()
   await p
   assert.equal(h.weights.calls, 0)
-  assert.equal(h.confirmation.asked[0]!.weightsGb, 12)
+  assert.equal(h.confirmation.asked[0]!.quote.weightsGb, 12)
 })
 
 test("catalog failure leaves the price unknown and provisioning is refused", async () => {
@@ -1405,9 +1784,11 @@ Expected: FAIL — cannot find `src/core/application/endpoint-service.ts`.
 ```ts
 import { buildEndpointSpec, type EndpointRecord, type Phase } from "../domain/endpoint.ts"
 import type { StateEvent } from "../domain/events.ts"
-import type { ModelConfig, Settings } from "../domain/model.ts"
+import { applyOverrides, idleTimeoutFor, type ModelConfig, type ModelOverrides, type Settings } from "../domain/model.ts"
+import { buildProposal, gpuVariantsFor, type PoolPricing, type ProvisionOverrides } from "../domain/provision.ts"
 import { DEFAULT_WEIGHTS_GB, buildQuote, type PoolRate, type Quote } from "../domain/quote.ts"
 import { SpendMeter } from "../domain/spend-meter.ts"
+import type { CatalogPublisherPort, PublishedModel } from "../ports/catalog-publisher.ts"
 import type { ClockPort } from "../ports/clock.ts"
 import { ComputeError, type ComputeProviderPort } from "../ports/compute-provider.ts"
 import type { ConfirmationPort } from "../ports/confirmation.ts"
@@ -1433,6 +1814,7 @@ export interface ServicePorts {
   clock: ClockPort
   confirmation: ConfirmationPort
   notifier: NotifierPort
+  publisher: CatalogPublisherPort
   logger: LoggerPort
 }
 
@@ -1448,38 +1830,36 @@ interface ModelState {
   rate: PoolRate | null
 }
 
+interface Priced {
+  quote: Quote
+  weightsGb: number | null
+  rate: PoolRate
+}
+
 const round = (n: number) => Math.round(n * 1000) / 1000
 export const recordKey = (modelID: string) => `endpoints/${modelID}`
 export const weightsKey = (hf: string) => `weights/${hf}`
+export const overridesKey = (modelID: string) => `overrides/${modelID}`
+export const modelKey = (modelID: string) => `models/${modelID}`
 
 export class EndpointService implements ModelRoutingPort {
   protected readonly settings: Settings
   protected readonly ports: ServicePorts
   protected readonly states = new Map<string, ModelState>()
+  /** Models added at runtime are persisted whole under models/<id>; static models persist overrides/<id>. */
+  protected readonly runtimeIDs = new Set<string>()
 
   constructor(settings: Settings, ports: ServicePorts) {
     this.settings = settings
     this.ports = ports
-    for (const model of settings.models) {
-      this.states.set(model.id, {
-        model,
-        phase: "cold",
-        detail: null,
-        record: null,
-        inflight: null,
-        lastRequestAt: null,
-        idleTimer: null,
-        meter: new SpendMeter(() => ports.clock.now()),
-        rate: null,
-      })
-    }
+    for (const model of settings.models) this.newState(model)
   }
 
   phase(modelID: string): Phase {
     return this.state(modelID).phase
   }
 
-  async ensureReady(modelID: string, opts: { skipConfirm?: boolean } = {}): Promise<string> {
+  async ensureReady(modelID: string, opts: { skipConfirm?: boolean; gpu?: string } = {}): Promise<string> {
     const st = this.state(modelID)
     if (st.inflight) return st.inflight
     const run = this.run(st, opts).finally(() => {
@@ -1491,9 +1871,25 @@ export class EndpointService implements ModelRoutingPort {
 
   // ---- internals -------------------------------------------------------
 
+  protected newState(model: ModelConfig): ModelState {
+    const st: ModelState = {
+      model,
+      phase: "cold",
+      detail: null,
+      record: null,
+      inflight: null,
+      lastRequestAt: null,
+      idleTimer: null,
+      meter: new SpendMeter(() => this.ports.clock.now()),
+      rate: null,
+    }
+    this.states.set(model.id, st)
+    return st
+  }
+
   protected state(modelID: string): ModelState {
     const st = this.states.get(modelID)
-    if (!st) throw new Error(`RunPod: model "${modelID}" is not configured (options.models)`)
+    if (!st) throw new Error(`RunPod: model "${modelID}" is not configured (options.models or /runpod-add)`)
     return st
   }
 
@@ -1507,43 +1903,122 @@ export class EndpointService implements ModelRoutingPort {
   private async run(st: ModelState, opts: { skipConfirm?: boolean }): Promise<string> {
     const compute = this.compute()
     if (!st.record) {
-      const quote = await this.quote(st)
-      if (quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${quote.blocked}`)
+      let priced = await this.price(st.model)
+      st.rate = priced.rate
+      if (priced.quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${priced.quote.blocked}`)
       if (this.settings.confirm && !opts.skipConfirm) {
-        this.setPhase(st, "confirming", `waiting for confirmation · ${quote.gpuLabel} · $${quote.ratePerHour.toFixed(2)}/h`)
-        const accepted = await this.ports.confirmation.ask(quote)
-        if (!accepted) {
+        this.setPhase(st, "confirming", `waiting for confirmation · ${priced.quote.gpuLabel} · $${priced.quote.ratePerHour.toFixed(2)}/h`)
+        const proposal = buildProposal({ quote: priced.quote, model: st.model, pricing: await this.pricing(), weightsGb: priced.weightsGb })
+        const decision = await this.ports.confirmation.ask(proposal)
+        if (!decision.accepted) {
           this.setPhase(st, "cold", "provisioning declined")
           throw new Error(
             `RunPod: provisioning of ${st.model.id} was declined or not confirmed within ${this.settings.confirmTimeoutSec}s. ` +
               `Run /runpod-up ${st.model.id} to provision without the dialog, or set options.confirm=false.`,
           )
         }
+        const overrides = this.changedOverrides(st.model, decision.overrides)
+        if (overrides) {
+          this.validateOverrides(overrides)
+          const candidate = applyOverrides(st.model, overrides)
+          const repriced = await this.price(candidate)
+          if (repriced.quote.blocked) {
+            this.setPhase(st, "cold", `refused: ${repriced.quote.blocked}`)
+            throw new Error(`RunPod: refusing to provision ${st.model.id}: ${repriced.quote.blocked}`)
+          }
+          await this.applyOverridesTo(st, overrides)
+          priced = repriced
+          st.rate = repriced.rate
+        }
       }
-      await this.create(st, quote, compute)
+      await this.create(st, priced, compute)
     }
     if (st.phase !== "ready") await this.warm(st, compute)
     this.touch(st)
     return compute.inferenceBaseURL(st.record!.endpointID)
   }
 
-  protected async rateFor(st: ModelState): Promise<PoolRate> {
-    try {
-      st.rate = await this.ports.catalog.rate(st.model.gpu)
-    } catch (error) {
-      this.ports.logger.warn("price lookup failed", { pool: st.model.gpu, error: String(error) })
-      if (!st.rate) st.rate = { ratePerHour: 0, source: "fallback", vramGb: null, label: st.model.gpu }
+  /** Only the parts of a dialog decision that differ from the effective config. */
+  private changedOverrides(model: ModelConfig, chosen: ProvisionOverrides): ModelOverrides | null {
+    const overrides: ModelOverrides = {}
+    if (chosen.gpu !== undefined && chosen.gpu !== model.gpu) overrides.gpu = chosen.gpu
+    if (chosen.idleTimeout !== undefined && chosen.idleTimeout !== idleTimeoutFor(model, this.settings)) overrides.idleTimeout = chosen.idleTimeout
+    return Object.keys(overrides).length > 0 ? overrides : null
+  }
+
+  protected validateOverrides(overrides: ModelOverrides): void {
+    const pools = this.ports.catalog.knownPools()
+    if (overrides.gpu !== undefined && !pools.includes(overrides.gpu)) {
+      throw new Error(`RunPod: unknown GPU pool "${overrides.gpu}" (known: ${pools.join(", ")})`)
     }
-    return st.rate
+    const idle = overrides.idleTimeout
+    if (idle !== undefined && idle !== null && (!Number.isInteger(idle) || idle < 1 || idle > 3600)) {
+      throw new Error("RunPod: idleTimeout must be an integer between 1 and 3600 seconds")
+    }
+    if (overrides.gpuCount !== undefined && (!Number.isInteger(overrides.gpuCount) || overrides.gpuCount < 1 || overrides.gpuCount > 8)) {
+      throw new Error("RunPod: gpuCount must be an integer between 1 and 8")
+    }
+    if (overrides.context !== undefined && (!Number.isInteger(overrides.context) || overrides.context < 1024)) {
+      throw new Error("RunPod: context must be an integer ≥ 1024")
+    }
+    if (overrides.output !== undefined && (!Number.isInteger(overrides.output) || overrides.output < 256)) {
+      throw new Error("RunPod: output must be an integer ≥ 256")
+    }
   }
 
-  private async quote(st: ModelState): Promise<Quote> {
-    const rate = await this.rateFor(st)
-    const weightsGb = st.model.weightsGb ?? (await this.weightsGb(st.model))
-    return buildQuote({ model: st.model, settings: this.settings, rate, weightsGb })
+  /** Applies validated overrides to the in-memory config, persists them and republishes the catalog. */
+  protected async applyOverridesTo(st: ModelState, overrides: ModelOverrides): Promise<void> {
+    st.model = applyOverrides(st.model, overrides)
+    st.rate = null
+    if (this.runtimeIDs.has(st.model.id)) {
+      await this.ports.store.set(modelKey(st.model.id), st.model)
+    } else {
+      const stored = (await this.ports.store.get<ModelOverrides>(overridesKey(st.model.id))) ?? {}
+      await this.ports.store.set(overridesKey(st.model.id), { ...stored, ...overrides })
+    }
+    await this.publish()
   }
 
-  private async weightsGb(model: ModelConfig): Promise<number | null> {
+  /** Every known pool priced; pools whose lookup fails are skipped. */
+  protected async pricing(): Promise<PoolPricing[]> {
+    const out: PoolPricing[] = []
+    for (const pool of this.ports.catalog.knownPools()) {
+      try {
+        out.push({ pool, rate: await this.ports.catalog.rate(pool) })
+      } catch (error) {
+        this.ports.logger.warn("price lookup failed", { pool, error: String(error) })
+      }
+    }
+    return out
+  }
+
+  /** Publishes the effective model list with GPU variants; never throws. */
+  protected async publish(): Promise<void> {
+    try {
+      const pricing = await this.pricing()
+      const models: PublishedModel[] = [...this.states.values()].map((st) => ({ config: st.model, variants: gpuVariantsFor(st.model, pricing) }))
+      await this.ports.publisher.publish(models)
+    } catch (error) {
+      this.ports.logger.warn("catalog publish failed", { error: String(error) })
+    }
+  }
+
+  protected async rateFor(model: ModelConfig): Promise<PoolRate> {
+    try {
+      return await this.ports.catalog.rate(model.gpu)
+    } catch (error) {
+      this.ports.logger.warn("price lookup failed", { pool: model.gpu, error: String(error) })
+      return { ratePerHour: 0, source: "fallback", vramGb: null, label: model.gpu }
+    }
+  }
+
+  private async price(model: ModelConfig): Promise<Priced> {
+    const rate = await this.rateFor(model)
+    const weightsGb = model.weightsGb ?? (await this.weightsGb(model))
+    return { quote: buildQuote({ model, settings: this.settings, rate, weightsGb }), weightsGb, rate }
+  }
+
+  protected async weightsGb(model: ModelConfig): Promise<number | null> {
     const cached = await this.ports.store.get<number>(weightsKey(model.hf))
     if (typeof cached === "number") return cached
     let size: number | null = null
@@ -1556,9 +2031,9 @@ export class EndpointService implements ModelRoutingPort {
     return size
   }
 
-  private async create(st: ModelState, quote: Quote, compute: ComputeProviderPort): Promise<void> {
-    this.setPhase(st, "creating", `creating endpoint on ${quote.gpuLabel}`)
-    const recipe = this.ports.recipe.recipe(st.model, this.settings, quote.weightsGb ?? DEFAULT_WEIGHTS_GB)
+  private async create(st: ModelState, priced: Priced, compute: ComputeProviderPort): Promise<void> {
+    this.setPhase(st, "creating", `creating endpoint on ${priced.quote.gpuLabel}`)
+    const recipe = this.ports.recipe.recipe(st.model, this.settings, priced.weightsGb ?? DEFAULT_WEIGHTS_GB)
     const spec = buildEndpointSpec(st.model, this.settings, recipe)
     let created: { id: string }
     try {
@@ -1585,6 +2060,7 @@ export class EndpointService implements ModelRoutingPort {
     const record = st.record!
     const clock = this.ports.clock
     const started = clock.now()
+    if (!st.rate) st.rate = await this.rateFor(st.model)
     st.meter.start(this.hourly(st), started)
     this.setPhase(st, "warming", "starting worker", 0)
     const controller = new AbortController()
@@ -1636,16 +2112,20 @@ export class EndpointService implements ModelRoutingPort {
     }
   }
 
+  protected idleMs(st: ModelState): number {
+    return idleTimeoutFor(st.model, this.settings) * 1000
+  }
+
   protected touch(st: ModelState): void {
     st.lastRequestAt = this.ports.clock.now()
     if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
-    st.idleTimer = this.ports.clock.setTimer(() => this.onIdle(st), this.settings.idleTimeout * 1000 + IDLE_GRACE_MS)
+    st.idleTimer = this.ports.clock.setTimer(() => this.onIdle(st), this.idleMs(st) + IDLE_GRACE_MS)
   }
 
   private onIdle(st: ModelState): void {
     st.idleTimer = null
     if (st.phase !== "ready" || st.lastRequestAt === null) return
-    st.meter.stop(st.lastRequestAt + this.settings.idleTimeout * 1000)
+    st.meter.stop(st.lastRequestAt + this.idleMs(st))
     this.setPhase(st, "idle", "worker scaled to zero")
     if (st.record) {
       st.record.spendUsd = round(st.meter.usd())
@@ -1690,7 +2170,7 @@ Expected: all tests pass (architecture test included — the service imports onl
 ```bash
 git rm -q src/core/application/.gitkeep
 git add src/core/ports src/core/application test/fakes test/service-ensure-ready.test.ts
-git commit -m "feat(core): ports and EndpointService provisioning path with test fakes"
+git commit -m "feat(core): ports, fakes and EndpointService provisioning with proposal-driven overrides"
 ```
 
 ---
@@ -1764,7 +2244,7 @@ test("fatal warm-up errors stop immediately, keep the endpoint and stop the mete
   assert.equal(h.service.phase("m"), "cold")
   assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
   assert.equal(h.notifier.events.at(-1)!.spendUsd, 0)
-  assert.equal(await h.store.get("endpoints/m") !== undefined, true)
+  assert.notEqual(await h.store.get("endpoints/m"), undefined)
 })
 
 test("cold start timeout aborts, includes worker diagnostics, and a retry re-warms without re-confirming", async () => {
@@ -1807,7 +2287,7 @@ test("idle detection stops the meter at lastRequest + idleTimeout and the next r
   assert.equal(h.service.phase("m"), "ready")
 })
 
-test("requests during the idle window keep the worker counted as warm", async () => {
+test("requests during the idle window keep the worker counted as warm; a per-model idle timeout is honoured", async () => {
   const h = harness()
   const { pending } = await startWarming(h)
   h.compute.finishWarmup()
@@ -1818,13 +2298,21 @@ test("requests during the idle window keep the worker counted as warm", async ()
   assert.equal(h.service.phase("m"), "ready")
   await h.clock.advance(20_000 + IDLE_GRACE_MS)
   assert.equal(h.service.phase("m"), "idle")
+
+  const short = harness({ models: [{ ...h.settings.models[0]!, idleTimeout: 30 }] })
+  const s = await startWarming(short)
+  short.compute.finishWarmup()
+  await s.pending
+  assert.equal(short.compute.created[0]!.workers.idleTimeoutSec, 30)
+  await short.clock.advance(30_000 + IDLE_GRACE_MS)
+  assert.equal(short.service.phase("m"), "idle")
 })
 ```
 
 - [ ] **Step 2: Run the tests**
 
 Run: `npm test`
-Expected: all pass. If one fails, fix `endpoint-service.ts` so that the behaviour matches the test (the tests encode the spec), re-run, and describe the fix in the commit body.
+Expected: all pass. If one fails, fix `endpoint-service.ts` so the behaviour matches the test (the tests encode the spec), re-run, and describe the fix in the commit body.
 
 - [ ] **Step 3: Commit**
 
@@ -1835,16 +2323,16 @@ git commit -m "test(core): characterize warm-up retries, timeouts, diagnostics a
 
 ---
 
-### Task 5: Lifecycle and operations — `start`, `down`, `stop`, `status`
+### Task 5: Lifecycle and runtime operations — `start`, `stop`, `down`, `status`, `add`, `set`, `remove`, `models`, variants
 
 **Files:**
 - Modify: `src/core/application/endpoint-service.ts`
-- Test: `test/service-lifecycle.test.ts`
+- Test: `test/service-lifecycle.test.ts`, `test/service-runtime-config.test.ts`
 
 **Interfaces:**
-- Produces: `EndpointService implements ModelRoutingPort, OperationsPort, LifecyclePort` — `start(): Promise<void>` (reconcile), `stop(budgetMs = 10000)`, `status(): Promise<StatusReport>`, `up(modelID)`, `down(modelID?)`.
+- Produces: `EndpointService implements ModelRoutingPort, OperationsPort, LifecyclePort` — `start()` (load persisted overrides + runtime models, reconcile remote endpoints, publish), `stop(budgetMs = 10000)`, `status()`, `up(modelID)`, `down(modelID?)`, `add(input)`, `set(modelID, overrides)`, `remove(modelID)`, `models()`; `ensureReady(modelID, { gpu })` applies a differing pool as an override before provisioning.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 `test/service-lifecycle.test.ts`:
 ```ts
@@ -1859,14 +2347,14 @@ function expectedHash(h: ReturnType<typeof harness>) {
   return specHashFor(model, h.settings, h.recipe.recipe(model, h.settings, null))
 }
 
-async function warm(h: ReturnType<typeof harness>) {
-  const p = h.service.ensureReady("m")
+async function warm(h: ReturnType<typeof harness>, modelID = "m") {
+  const p = h.service.ensureReady(modelID)
   await flush()
   h.compute.finishWarmup()
   await p
 }
 
-test("start adopts a matching remote endpoint, stores a record and reports idle", async () => {
+test("start adopts a matching remote endpoint, stores a record, reports idle and publishes the catalog", async () => {
   const h = harness()
   h.compute.remote.push({ id: "epX", name: "oc-runpod-m", hash: expectedHash(h) })
   await h.service.start()
@@ -1876,6 +2364,7 @@ test("start adopts a matching remote endpoint, stores a record and reports idle"
   assert.equal(record?.hash, expectedHash(h))
   assert.deepEqual(h.notifier.phases, ["idle"])
   assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
+  assert.deepEqual(h.publisher.latest?.map((m) => [m.config.id, m.variants]), [["m", ["AMPERE_48", "AMPERE_80"]]])
   const p = h.service.ensureReady("m") // adopted → warm without confirm or create
   await flush()
   assert.equal(h.confirmation.asked.length, 0)
@@ -1884,7 +2373,7 @@ test("start adopts a matching remote endpoint, stores a record and reports idle"
   assert.equal(await p, "https://compute.test/epX/v1")
 })
 
-test("start deletes stale endpoints (hash mismatch, unknown model, duplicates) when deleteOnExit", async () => {
+test("start replaces stale endpoints of configured models (hash mismatch, duplicates) and reports unknown ones as orphans", async () => {
   const h = harness()
   h.compute.remote.push({ id: "old", name: "oc-runpod-m", hash: "0000000000000000" })
   h.compute.remote.push({ id: "gone", name: "oc-runpod-removed-model", hash: expectedHash(h) })
@@ -1893,20 +2382,18 @@ test("start deletes stale endpoints (hash mismatch, unknown model, duplicates) w
   h.compute.remote.push({ id: "unrelated", name: "someone-elses-endpoint", hash: null })
   await h.service.start()
   const deleted = h.compute.calls.filter((c) => c.startsWith("delete:")).map((c) => c.slice(7)).sort()
-  assert.deepEqual(deleted, ["dup", "gone", "old"])
+  assert.deepEqual(deleted, ["dup", "old"])
   assert.equal((await h.store.get<EndpointRecord>("endpoints/m"))?.endpointID, "keep")
-  const status = await h.service.status()
-  assert.deepEqual(status.orphans, [])
+  assert.deepEqual((await h.service.status()).orphans, [{ id: "gone", name: "oc-runpod-removed-model" }])
 })
 
-test("start keeps stale endpoints as orphans when deleteOnExit is false or adoptExisting is false", async () => {
-  const h = harness({ deleteOnExit: false, adoptExisting: false })
+test("start leaves a matching endpoint alone (as an orphan) when adoptExisting is false", async () => {
+  const h = harness({ adoptExisting: false })
   h.compute.remote.push({ id: "epX", name: "oc-runpod-m", hash: expectedHash(h) })
   await h.service.start()
   assert.equal(h.service.phase("m"), "cold")
   assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
-  const status = await h.service.status()
-  assert.deepEqual(status.orphans, [{ id: "epX", name: "oc-runpod-m" }])
+  assert.deepEqual((await h.service.status()).orphans, [{ id: "epX", name: "oc-runpod-m" }])
 })
 
 test("start restores a stored record when its endpoint still exists and drops it otherwise", async () => {
@@ -1924,10 +2411,11 @@ test("start restores a stored record when its endpoint still exists and drops it
   assert.equal(vanished.service.phase("m"), "cold")
 })
 
-test("start is a no-op without a compute provider", async () => {
+test("start without a compute provider still loads persisted config and publishes", async () => {
   const h = harness({}, { compute: false })
   await h.service.start()
   assert.equal(h.compute.calls.length, 0)
+  assert.equal(h.publisher.published.length, 1)
 })
 
 test("down scales to zero, deletes, clears storage and reports spend", async () => {
@@ -1939,20 +2427,15 @@ test("down scales to zero, deletes, clears storage and reports spend", async () 
   assert.deepEqual(h.compute.calls.filter((c) => /^(scaleToZero|delete):/.test(c)), ["scaleToZero:ep1", "delete:ep1"])
   assert.equal(await h.store.get("endpoints/m"), undefined)
   assert.equal(h.service.phase("m"), "cold")
-  const last = h.notifier.events.at(-1)!
-  assert.match(last.detail ?? "", /deleted · ≈\$0\.01 this session/)
+  assert.match(h.notifier.events.at(-1)!.detail ?? "", /deleted · ≈\$0\.01 this session/)
   assert.deepEqual(await h.service.down(), [])
   assert.deepEqual(h.notifier.phases.slice(-2), ["deleting", "cold"])
 })
 
 test("down without a model id deletes every owned endpoint; delete failures surface", async () => {
   const two = harness({ models: [sampleModel(), sampleModel({ id: "n", hf: "Qwen/Qwen3-8B", gpu: "AMPERE_16" })] })
-  for (const id of ["m", "n"]) {
-    const p = two.service.ensureReady(id)
-    await flush()
-    two.compute.finishWarmup()
-    await p
-  }
+  await warm(two, "m")
+  await warm(two, "n")
   assert.deepEqual(await two.service.down(), ["m", "n"])
   const failing = harness()
   await warm(failing)
@@ -1961,12 +2444,12 @@ test("down without a model id deletes every owned endpoint; delete failures surf
   assert.equal(failing.service.phase("m"), "error")
 })
 
-test("stop deletes owned endpoints only when deleteOnExit is set", async () => {
-  const on = harness()
+test("stop deletes owned endpoints only when deleteOnExit is set (default off)", async () => {
+  const on = harness({ deleteOnExit: true })
   await warm(on)
   await on.service.stop(10_000)
   assert.ok(on.compute.calls.includes("delete:ep1"))
-  const off = harness({ deleteOnExit: false })
+  const off = harness()
   await warm(off)
   await off.service.stop(10_000)
   assert.equal(off.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
@@ -1999,70 +2482,261 @@ test("status reports phase, endpoint, rate, spend, billed and orphans; up() skip
 })
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+`test/service-runtime-config.test.ts`:
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { IDLE_GRACE_MS } from "../src/core/application/endpoint-service.ts"
+import type { ModelConfig } from "../src/core/domain/model.ts"
+import { flush } from "./fakes/clock.ts"
+import { harness, sampleModel } from "./fakes/fixtures.ts"
+
+async function warm(h: ReturnType<typeof harness>, modelID = "m", gpu?: string) {
+  const p = h.service.ensureReady(modelID, gpu === undefined ? {} : { gpu })
+  await flush()
+  h.compute.finishWarmup()
+  return p
+}
+
+test("start loads persisted overrides and runtime models, then publishes them with variants", async () => {
+  const h = harness()
+  await h.store.set("overrides/m", { gpu: "AMPERE_80" })
+  const extra: ModelConfig = sampleModel({ id: "extra", hf: "Qwen/Qwen3-8B", gpu: "AMPERE_16", quantization: null })
+  await h.store.set("models/extra", extra)
+  await h.service.start()
+  assert.deepEqual(h.service.models().map((m) => [m.id, m.gpu]), [["m", "AMPERE_80"], ["extra", "AMPERE_16"]])
+  assert.deepEqual(h.publisher.latest?.map((m) => [m.config.id, m.variants]), [["m", ["AMPERE_80"]], ["extra", ["AMPERE_16", "AMPERE_48", "AMPERE_80"]]])
+  assert.equal((await h.service.status()).models[0]!.gpuLabel, "A100 80GB")
+})
+
+test("add derives the id, picks the cheapest fitting pool from the weights, persists and publishes", async () => {
+  const h = harness()
+  const added = await h.service.add({ hf: "Qwen/Qwen3-8B" })
+  assert.equal(added.id, "qwen3-8b")
+  assert.equal(added.gpu, "AMPERE_48") // 31.6 GB: AMPERE_16 does not fit, AMPERE_48 is cheaper than AMPERE_80
+  assert.equal(added.weightsGb, 31.6)
+  assert.equal(added.name, "qwen3-8b (RunPod)")
+  assert.equal(added.context, 32768)
+  assert.deepEqual(await h.store.get<ModelConfig>("models/qwen3-8b"), added)
+  assert.deepEqual(h.service.models().map((m) => m.id), ["m", "qwen3-8b"])
+  assert.deepEqual(h.publisher.latest?.map((m) => m.config.id), ["m", "qwen3-8b"])
+  await assert.rejects(h.service.add({ hf: "Qwen/Qwen3-8B" }), /already exists/)
+  const explicit = await h.service.add({ hf: "org/Big-Model", gpu: "AMPERE_80", overrides: { context: 8192, idleTimeout: 60 } })
+  assert.equal(explicit.gpu, "AMPERE_80")
+  assert.equal(explicit.context, 8192)
+  assert.equal(explicit.idleTimeout, 60)
+  await assert.rejects(h.service.add({ hf: "org/Other", gpu: "NOPE" }), /unknown GPU pool "NOPE"/)
+})
+
+test("add refuses when the size is unknown or nothing fits", async () => {
+  const unknown = harness({}, { weights: null })
+  await assert.rejects(unknown.service.add({ hf: "org/Mystery" }), /weights unknown.*known: AMPERE_16, AMPERE_48, AMPERE_80/s)
+  const huge = harness({}, { weights: 500 })
+  await assert.rejects(huge.service.add({ hf: "org/Huge" }), /no known GPU pool fits ≈500 GB/)
+})
+
+test("set with a hash-changing key deletes the live endpoint and re-provisions on next use", async () => {
+  const h = harness()
+  await warm(h)
+  const next = await h.service.set("m", { gpu: "AMPERE_80" })
+  assert.equal(next.gpu, "AMPERE_80")
+  assert.ok(h.compute.calls.includes("delete:ep1"))
+  assert.equal(h.service.phase("m"), "cold")
+  assert.match(h.notifier.notices.at(-1)!.message, /configuration of m changed.*re-provisioned on next use/)
+  assert.deepEqual(await h.store.get("overrides/m"), { gpu: "AMPERE_80" })
+  assert.deepEqual(h.publisher.latest?.[0]!.variants, ["AMPERE_80"])
+  const p = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.confirmation.asked.length, 2)
+  assert.equal(h.compute.created[1]!.gpu.pool, "AMPERE_80")
+  h.compute.finishWarmup()
+  await p
+})
+
+test("set with only idleTimeout patches the live endpoint and re-arms the idle timer", async () => {
+  const h = harness()
+  await warm(h)
+  await h.service.set("m", { idleTimeout: 30 })
+  assert.ok(h.compute.calls.includes("setIdleTimeout:ep1:30"))
+  assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
+  assert.equal(h.service.phase("m"), "ready")
+  await h.clock.advance(30_000 + IDLE_GRACE_MS)
+  assert.equal(h.service.phase("m"), "idle")
+  assert.deepEqual(await h.store.get("overrides/m"), { idleTimeout: 30 })
+})
+
+test("set validates values and merges with earlier overrides", async () => {
+  const h = harness()
+  await assert.rejects(h.service.set("m", { gpuCount: 0 }), /gpuCount must be an integer between 1 and 8/)
+  await assert.rejects(h.service.set("m", { context: 100 }), /context must be an integer ≥ 1024/)
+  await assert.rejects(h.service.set("m", { output: 10 }), /output must be an integer ≥ 256/)
+  await assert.rejects(h.service.set("nope", { gpu: "AMPERE_16" }), /not configured/)
+  await h.service.set("m", { gpu: "AMPERE_80" })
+  await h.service.set("m", { idleTimeout: 300 })
+  assert.deepEqual(await h.store.get("overrides/m"), { gpu: "AMPERE_80", idleTimeout: 300 })
+  assert.equal(h.service.models()[0]!.idleTimeout, 300)
+})
+
+test("remove deletes a runtime model with its endpoint and resets a static model's overrides", async () => {
+  const h = harness()
+  const added = await h.service.add({ hf: "Qwen/Qwen3-8B" })
+  await warm(h, added.id)
+  assert.equal(await h.service.remove(added.id), "removed")
+  assert.ok(h.compute.calls.includes("delete:ep1"))
+  assert.equal(await h.store.get("models/qwen3-8b"), undefined)
+  assert.deepEqual(h.service.models().map((m) => m.id), ["m"])
+  await assert.rejects(h.service.remove(added.id), /not configured/)
+
+  await h.service.set("m", { gpu: "AMPERE_80" })
+  await warm(h) // ep2 on AMPERE_80
+  assert.equal(await h.service.remove("m"), "reset")
+  assert.equal(h.service.models()[0]!.gpu, "AMPERE_48")
+  assert.equal(await h.store.get("overrides/m"), undefined)
+  assert.ok(h.compute.calls.includes("delete:ep2"))
+  assert.equal(h.service.phase("m"), "cold")
+})
+
+test("a variant pool passed to ensureReady is applied as an override before provisioning", async () => {
+  const h = harness()
+  const url = await warm(h, "m", "AMPERE_80")
+  assert.equal(url, "https://compute.test/ep1/v1")
+  assert.equal(h.confirmation.asked[0]!.quote.gpu, "AMPERE_80")
+  assert.equal(h.confirmation.asked[0]!.quote.ratePerHour, 2.72)
+  assert.equal(h.compute.created[0]!.gpu.pool, "AMPERE_80")
+  assert.deepEqual(await h.store.get("overrides/m"), { gpu: "AMPERE_80" })
+
+  const same = harness()
+  await warm(same, "m", "AMPERE_48")
+  assert.equal(await same.store.get("overrides/m"), undefined)
+
+  const switching = harness()
+  await warm(switching, "m") // ep1 on AMPERE_48
+  await warm(switching, "m", "AMPERE_16") // variant → set → delete ep1 → confirm → ep2
+  assert.ok(switching.compute.calls.includes("delete:ep1"))
+  assert.equal(switching.compute.created[1]!.gpu.pool, "AMPERE_16")
+  assert.equal(switching.confirmation.asked.length, 2)
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `npm test`
-Expected: FAIL — `start`, `down`, `stop`, `status`, `up` are not functions.
+Expected: FAIL — `start`, `down`, `stop`, `status`, `up`, `add`, `set`, `remove`, `models` are not functions.
 
-- [ ] **Step 3: Add the lifecycle and operations methods to `EndpointService`**
+- [ ] **Step 3: Add the lifecycle and runtime-config methods to `EndpointService`**
 
-Change the class declaration and imports:
+Change the imports and the class declaration:
 ```ts
 import { buildEndpointSpec, modelIDFromName, specHashFor, type EndpointRecord, type Phase } from "../domain/endpoint.ts"
 import type { ModelStatus, StateEvent, StatusReport } from "../domain/events.ts"
-import type { LifecyclePort, ModelRoutingPort, OperationsPort } from "../ports/driving.ts"
+import { applyOverrides, deriveModelID, findModel, idleTimeoutFor, type ModelConfig, type ModelOverrides, type Settings } from "../domain/model.ts"
+import { buildProposal, gpuVariantsFor, type PoolPricing, type ProvisionOverrides } from "../domain/provision.ts"
+import { DEFAULT_WEIGHTS_GB, buildQuote, fitsPool, type PoolRate, type Quote } from "../domain/quote.ts"
+import type { AddModelInput, LifecyclePort, ModelRoutingPort, OperationsPort } from "../ports/driving.ts"
 // ...
 export class EndpointService implements ModelRoutingPort, OperationsPort, LifecyclePort {
   private orphans: { id: string; name: string }[] = []
 ```
+
+Replace `ensureReady` so a differing variant pool is applied first:
+```ts
+  async ensureReady(modelID: string, opts: { skipConfirm?: boolean; gpu?: string } = {}): Promise<string> {
+    const st = this.state(modelID)
+    if (st.inflight) return st.inflight
+    const run = (async () => {
+      if (opts.gpu !== undefined && opts.gpu !== st.model.gpu) await this.set(modelID, { gpu: opts.gpu })
+      return this.run(st, opts)
+    })().finally(() => {
+      st.inflight = null
+    })
+    st.inflight = run
+    return run
+  }
+```
+
+Replace `touch` with `touch` + `armIdle` (so `set` can re-arm without moving `lastRequestAt`):
+```ts
+  protected touch(st: ModelState): void {
+    st.lastRequestAt = this.ports.clock.now()
+    this.armIdle(st)
+  }
+
+  private armIdle(st: ModelState): void {
+    if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
+    if (st.lastRequestAt === null) return
+    const due = st.lastRequestAt + this.idleMs(st) + IDLE_GRACE_MS - this.ports.clock.now()
+    st.idleTimer = this.ports.clock.setTimer(() => this.onIdle(st), Math.max(0, due))
+  }
+```
+
 Add these methods after `ensureReady`:
 ```ts
   up(modelID: string): Promise<string> {
     return this.ensureReady(modelID, { skipConfirm: true })
   }
 
-  /** Reconcile remote endpoints with configuration: restore or adopt matching ones, remove stale ones. */
+  models(): readonly ModelConfig[] {
+    return [...this.states.values()].map((st) => st.model)
+  }
+
+  /** Load persisted runtime config, reconcile remote endpoints, publish the catalog. */
   async start(): Promise<void> {
-    const compute = this.ports.compute
-    if (!compute) return
-    this.orphans = []
-    const remote = await compute.list()
-    const byId = new Map(remote.map((ep) => [ep.id, ep] as const))
     for (const st of this.states.values()) {
-      const stored = await this.ports.store.get<EndpointRecord>(recordKey(st.model.id))
-      if (!stored) continue
-      const ep = byId.get(stored.endpointID)
-      if (ep && ep.hash === this.expectedHash(st.model)) {
-        st.record = stored
-        await this.rateFor(st)
-        this.setPhase(st, "idle", "restored endpoint from storage")
-      } else {
-        await this.ports.store.remove(recordKey(st.model.id))
-      }
+      const stored = await this.ports.store.get<ModelOverrides>(overridesKey(st.model.id))
+      if (stored && Object.keys(stored).length > 0) st.model = applyOverrides(st.model, stored)
     }
-    for (const ep of remote) {
-      const modelID = modelIDFromName(ep.name)
-      if (modelID === null) continue
-      const st = this.states.get(modelID)
-      if (st?.record?.endpointID === ep.id) continue
-      if (st && !st.record && this.settings.adoptExisting && ep.hash !== null && ep.hash === this.expectedHash(st.model)) {
-        st.record = { endpointID: ep.id, name: ep.name, modelID, gpu: st.model.gpu, gpuCount: st.model.gpuCount, hash: ep.hash, createdAt: this.ports.clock.now(), spendUsd: 0 }
-        await this.ports.store.set(recordKey(modelID), st.record)
-        await this.rateFor(st)
-        this.setPhase(st, "idle", "adopted existing endpoint")
-        continue
-      }
-      if (this.settings.deleteOnExit) {
-        try {
-          await compute.delete(ep.id)
-          this.ports.logger.info("deleted stale endpoint", { id: ep.id, name: ep.name })
-          continue
-        } catch (error) {
-          this.ports.logger.warn("failed to delete stale endpoint", { id: ep.id, error: String(error) })
+    for (const key of await this.ports.store.keys("models/")) {
+      const config = await this.ports.store.get<ModelConfig>(key)
+      if (!config || this.states.has(config.id)) continue
+      this.newState(config)
+      this.runtimeIDs.add(config.id)
+    }
+    const compute = this.ports.compute
+    if (compute) {
+      this.orphans = []
+      const remote = await compute.list()
+      const byId = new Map(remote.map((ep) => [ep.id, ep] as const))
+      for (const st of this.states.values()) {
+        const stored = await this.ports.store.get<EndpointRecord>(recordKey(st.model.id))
+        if (!stored) continue
+        const ep = byId.get(stored.endpointID)
+        if (ep && ep.hash === this.expectedHash(st.model)) {
+          st.record = stored
+          st.rate = await this.rateFor(st.model)
+          this.setPhase(st, "idle", "restored endpoint from storage")
+        } else {
+          await this.ports.store.remove(recordKey(st.model.id))
         }
       }
-      this.orphans.push({ id: ep.id, name: ep.name })
+      for (const ep of remote) {
+        const modelID = modelIDFromName(ep.name)
+        if (modelID === null) continue
+        const st = this.states.get(modelID)
+        if (st?.record?.endpointID === ep.id) continue
+        const matches = st !== undefined && ep.hash !== null && ep.hash === this.expectedHash(st.model)
+        if (st && !st.record && this.settings.adoptExisting && matches) {
+          st.record = { endpointID: ep.id, name: ep.name, modelID, gpu: st.model.gpu, gpuCount: st.model.gpuCount, hash: ep.hash!, createdAt: this.ports.clock.now(), spendUsd: 0 }
+          await this.ports.store.set(recordKey(modelID), st.record)
+          st.rate = await this.rateFor(st.model)
+          this.setPhase(st, "idle", "adopted existing endpoint")
+          continue
+        }
+        // Ours (a configured model) but stale — different config or a duplicate: it would be replaced on next use anyway.
+        const stale = st !== undefined && (!matches || st.record !== null)
+        if (stale) {
+          try {
+            await compute.delete(ep.id)
+            this.ports.logger.info("deleted stale endpoint", { id: ep.id, name: ep.name })
+            continue
+          } catch (error) {
+            this.ports.logger.warn("failed to delete stale endpoint", { id: ep.id, error: String(error) })
+          }
+        }
+        // Unknown model (removed from config, or another opencode location's): never deleted automatically.
+        this.orphans.push({ id: ep.id, name: ep.name })
+      }
     }
+    await this.publish()
   }
 
   /** Best-effort teardown within a time budget; used at plugin shutdown. */
@@ -2111,7 +2785,7 @@ Add these methods after `ensureReady`:
   async status(): Promise<StatusReport> {
     const models: ModelStatus[] = []
     for (const st of this.states.values()) {
-      const rate = await this.rateFor(st)
+      st.rate = await this.rateFor(st.model)
       let billedUsd: number | null = null
       if (st.record && this.ports.compute) billedUsd = await this.ports.compute.billedUsd(st.record.endpointID).catch(() => null)
       models.push({
@@ -2121,7 +2795,7 @@ Add these methods after `ensureReady`:
         spendUsd: round(st.meter.usd()),
         ratePerHour: this.hourly(st),
         gpu: st.model.gpu,
-        gpuLabel: rate.label,
+        gpuLabel: st.rate.label,
         endpointID: st.record?.endpointID ?? null,
         gpuCount: st.model.gpuCount,
         billedUsd,
@@ -2129,6 +2803,88 @@ Add these methods after `ensureReady`:
       })
     }
     return { models, orphans: [...this.orphans] }
+  }
+
+  async add(input: AddModelInput): Promise<ModelConfig> {
+    const id = deriveModelID(input.hf)
+    if (this.states.has(id)) throw new Error(`RunPod: model "${id}" already exists (use /runpod-set ${id} key=value to change it)`)
+    const pools = this.ports.catalog.knownPools()
+    const draft: ModelConfig = {
+      id,
+      name: `${id} (RunPod)`,
+      hf: input.hf,
+      gpu: input.gpu ?? "",
+      gpuCount: 1,
+      context: 32768,
+      output: 8192,
+      tools: true,
+      family: null,
+      toolParser: undefined,
+      reasoningParser: undefined,
+      quantization: null,
+      weightsGb: null,
+      idleTimeout: null,
+      env: {},
+    }
+    const config = applyOverrides(draft, input.overrides ?? {})
+    if (config.gpu === "") {
+      const weightsGb = config.weightsGb ?? (await this.weightsGb(config))
+      if (weightsGb === null) {
+        throw new Error(`RunPod: cannot size ${input.hf} (weights unknown); pass a GPU pool explicitly (known: ${pools.join(", ")})`)
+      }
+      const fitting = (await this.pricing())
+        .filter((p) => p.rate.ratePerHour > 0 && fitsPool(weightsGb, p.rate.vramGb, config.gpuCount) === true)
+        .sort((a, b) => a.rate.ratePerHour - b.rate.ratePerHour)
+      if (fitting.length === 0) {
+        throw new Error(`RunPod: no known GPU pool fits ≈${weightsGb} GB of weights with gpuCount ${config.gpuCount}; pass a pool and gpuCount explicitly`)
+      }
+      config.gpu = fitting[0]!.pool
+      config.weightsGb = weightsGb
+    }
+    this.validateOverrides({ gpu: config.gpu, gpuCount: config.gpuCount, context: config.context, output: config.output, idleTimeout: config.idleTimeout })
+    this.newState(config)
+    this.runtimeIDs.add(id)
+    await this.ports.store.set(modelKey(id), config)
+    await this.publish()
+    return config
+  }
+
+  async set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig> {
+    const st = this.state(modelID)
+    this.validateOverrides(overrides)
+    const next = applyOverrides(st.model, overrides)
+    const record = st.record
+    if (record) {
+      if (this.expectedHash(st.model) !== this.expectedHash(next)) {
+        this.ports.notifier.notice("info", `RunPod: configuration of ${modelID} changed; endpoint ${record.endpointID} is deleted and will be re-provisioned on next use.`)
+        await this.down(modelID)
+      } else if (idleTimeoutFor(next, this.settings) !== idleTimeoutFor(st.model, this.settings)) {
+        await this.compute().setIdleTimeout(record.endpointID, idleTimeoutFor(next, this.settings))
+      }
+    }
+    await this.applyOverridesTo(st, overrides)
+    if (st.phase === "ready") this.armIdle(st)
+    return st.model
+  }
+
+  async remove(modelID: string): Promise<"removed" | "reset"> {
+    const st = this.state(modelID)
+    if (this.runtimeIDs.has(modelID)) {
+      if (st.record) await this.down(modelID)
+      if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
+      this.states.delete(modelID)
+      this.runtimeIDs.delete(modelID)
+      await this.ports.store.remove(modelKey(modelID))
+      await this.publish()
+      return "removed"
+    }
+    const base = findModel(this.settings, modelID)!
+    if (st.record && this.expectedHash(st.model) !== this.expectedHash(base)) await this.down(modelID)
+    st.model = base
+    st.rate = null
+    await this.ports.store.remove(overridesKey(modelID))
+    await this.publish()
+    return "reset"
   }
 
   private expectedHash(model: ModelConfig): string {
@@ -2139,13 +2895,13 @@ Add these methods after `ensureReady`:
 - [ ] **Step 4: Run tests and typecheck**
 
 Run: `npm run check`
-Expected: pass. (`expectedHash` matches the test helper because both call the recipe with `weightsGb = null` and hash excludes disk.)
+Expected: pass. (`expectedHash` matches the test helper because both call the recipe with `weightsGb = null` and the hash excludes disk. In the "variant" test the first `warm` on AMPERE_80 asks once because `set` happens before `run`.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/core/application/endpoint-service.ts test/service-lifecycle.test.ts
-git commit -m "feat(core): reconcile on start, teardown, shutdown budget and status reporting"
+git add src/core/application/endpoint-service.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts
+git commit -m "feat(core): reconcile on start, teardown, status and runtime model configuration (add/set/remove, variants)"
 ```
 
 ---
@@ -2153,7 +2909,7 @@ git commit -m "feat(core): reconcile on start, teardown, shutdown budget and sta
 ### Task 6: RunPod REST v2 HTTP client (driven adapter, transport layer)
 
 **Files:**
-- Create: `src/adapters/driven/runpod/types.ts`, `src/adapters/driven/runpod/http.ts`
+- Create: `src/adapters/driven/runpod/types.ts`, `src/adapters/driven/runpod/http.ts` (delete `src/adapters/driven/.gitkeep`)
 - Test: `test/runpod-http.test.ts`
 
 **Interfaces:**
@@ -2612,7 +3368,7 @@ git commit -m "feat(runpod): REST v2 HTTP client with retries, pagination and ru
 
 **Interfaces:**
 - Consumes: `ComputeProviderPort`, `ComputeError`, `RemoteEndpoint`, `HealthSnapshot` (core ports), `EndpointSpec` (domain), `PriceCatalogPort`, `PoolRate`, `ClockPort`, `RunpodHttpLike`, `RunpodError`, types (Task 6).
-- Produces: `POOLS: Record<string, { label; vramGb; fallbackUsdPerHour }>`, `MARKER_ENV = "OPENCODE_RUNPOD"`, `HASH_ENV = "OPENCODE_RUNPOD_HASH"`, `class RunpodComputeProvider implements ComputeProviderPort { constructor(http: RunpodHttpLike) }`, `toCreateBody(spec: EndpointSpec): CreateEndpointRequest`, `class RunpodPriceCatalog implements PriceCatalogPort { constructor(http: Pick<RunpodHttpLike, "catalogGpus"> | null, clock: ClockPort, ttlMs = 600000) }`.
+- Produces: `POOLS`, `MARKER_ENV = "OPENCODE_RUNPOD"`, `HASH_ENV = "OPENCODE_RUNPOD_HASH"`, `toCreateBody(spec)`, `class RunpodComputeProvider implements ComputeProviderPort { constructor(http: RunpodHttpLike) }` (incl. `setIdleTimeout` → `PATCH workers.idleTimeout`), `class RunpodPriceCatalog implements PriceCatalogPort { constructor(http: { catalogGpus() } | null, clock: ClockPort, ttlMs = 600000) }`.
 
 - [ ] **Step 1: Create `src/adapters/driven/runpod/pools.ts`**
 
@@ -2714,11 +3470,13 @@ test("list exposes ids, names and the hash marker; create returns the id", async
   assert.equal(provider.inferenceBaseURL("ep9"), "https://api.runpod.ai/v2/ep9/openai/v1")
 })
 
-test("scaleToZero patches workers; delete tolerates 404 only", async () => {
+test("scaleToZero and setIdleTimeout patch workers; delete tolerates 404 only", async () => {
   const http = new FakeHttp()
   const provider = new RunpodComputeProvider(http)
   await provider.scaleToZero("ep1")
   assert.equal(http.calls.at(-1), 'patch:ep1:{"workers":{"min":0,"max":0}}')
+  await provider.setIdleTimeout("ep1", 30)
+  assert.equal(http.calls.at(-1), 'patch:ep1:{"workers":{"idleTimeout":30}}')
   http.deleteError = new RunpodError(404, "Not Found", null, "DELETE")
   await provider.delete("ep1")
   http.deleteError = new RunpodError(403, "Forbidden", null, "DELETE")
@@ -2875,6 +3633,10 @@ export class RunpodComputeProvider implements ComputeProviderPort {
     await this.http.patchEndpoint(id, { workers: { min: 0, max: 0 } })
   }
 
+  async setIdleTimeout(id: string, seconds: number): Promise<void> {
+    await this.http.patchEndpoint(id, { workers: { idleTimeout: seconds } })
+  }
+
   async delete(id: string): Promise<void> {
     try {
       await this.http.deleteEndpoint(id)
@@ -2906,8 +3668,7 @@ export class RunpodComputeProvider implements ComputeProviderPort {
     const unhealthy = workers.find((w) => w.status.toUpperCase() === "UNHEALTHY")
     if (!unhealthy) return null
     const text = await this.http.workerLogs(id, unhealthy.id)
-    const lines = text.trim().split("\n")
-    return lines.slice(-LOG_TAIL_LINES).join("\n")
+    return text.trim().split("\n").slice(-LOG_TAIL_LINES).join("\n")
   }
 
   billedUsd(id: string): Promise<number | null> {
@@ -3331,9 +4092,9 @@ git commit -m "feat(huggingface): weights size adapter"
 - Test: `test/rpc-contract.test.ts`, `test/format.test.ts`
 
 **Interfaces:**
-- Consumes: domain types `Quote`, `StateEvent`, `ModelStatus`, `StatusReport`, `Phase`, `NoticeLevel`.
-- Produces (`contract.ts`): zod schemas `PhaseSchema`, `QuoteSchema: z.ZodType<Quote>`, `StateEventSchema: z.ZodType<StateEvent>`, `ModelStatusSchema: z.ZodType<ModelStatus>`, `StatusReportSchema: z.ZodType<StatusReport>`, `NoticeSchema`, and `RunpodRpc` (`id: "runpod"`, methods `status/up/down/confirm`, events `confirm.requested/state/notice`).
-- Produces (`format.ts`): `formatUsd`, `formatDuration`, `formatQuote`, `phaseLabel`, `footerLabel`, `formatStatus`.
+- Consumes: domain types `Quote`, `StateEvent`, `ModelStatus`, `StatusReport`, `Phase`, `NoticeLevel`, `GpuOption`, `ProvisionProposal`, `ProvisionOverrides`.
+- Produces (`contract.ts`): `PhaseSchema`, `QuoteSchema: z.ZodType<Quote>`, `GpuOptionSchema: z.ZodType<GpuOption>`, `ProvisionProposalSchema: z.ZodType<ProvisionProposal>`, `ProvisionOverridesSchema: z.ZodType<ProvisionOverrides>`, `StateEventSchema: z.ZodType<StateEvent>`, `ModelStatusSchema: z.ZodType<ModelStatus>`, `StatusReportSchema: z.ZodType<StatusReport>`, `NoticeSchema`, `RunpodRpc` (`id: "runpod"`, methods `status/up/down/confirm`, events `confirm.requested/state/notice`).
+- Produces (`format.ts`): `formatUsd`, `formatDuration`, `formatQuote`, `formatGpuOption(option)`, `formatIdleChoice(seconds, ratePerHour)`, `phaseLabel`, `footerLabel`, `formatStatus`, `formatModel(config)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3341,7 +4102,9 @@ git commit -m "feat(huggingface): weights size adapter"
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { QuoteSchema, RunpodRpc, StateEventSchema, StatusReportSchema } from "../rpc.ts"
+import { ProvisionProposalSchema, QuoteSchema, RunpodRpc, StateEventSchema, StatusReportSchema } from "../rpc.ts"
+
+const quote = { modelID: "m", hf: "a/b", gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", gpuCount: 1, ratePerHour: 1.22, rateSource: "catalog", weightsGb: 31.6, estColdStartSec: 156, idleTimeout: 120, idleWindowUsd: 0.04, warnings: [], blocked: null }
 
 test("contract exposes the four methods and three events", () => {
   assert.equal(RunpodRpc.id, "runpod")
@@ -3350,12 +4113,20 @@ test("contract exposes the four methods and three events", () => {
 })
 
 test("schemas accept well-formed payloads and reject bad phases", () => {
-  const quote = { modelID: "m", hf: "a/b", gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", gpuCount: 1, ratePerHour: 1.22, rateSource: "catalog", weightsGb: 31.6, estColdStartSec: 156, idleTimeout: 120, idleWindowUsd: 0.04, warnings: [], blocked: null }
   assert.equal(QuoteSchema.safeParse(quote).success, true)
   const state = { modelID: "m", phase: "warming", detail: "starting", elapsedSec: 3, spendUsd: 0.001, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB" }
   assert.equal(StateEventSchema.safeParse(state).success, true)
   assert.equal(StateEventSchema.safeParse({ ...state, phase: "hot" }).success, false)
   assert.equal(StatusReportSchema.safeParse({ models: [], orphans: [] }).success, true)
+})
+
+test("proposal and confirm payloads round-trip", () => {
+  const proposal = { quote, gpuOptions: [{ pool: "AMPERE_48", label: "A6000/A40 48GB", ratePerHour: 1.22, rateSource: "catalog", vramGb: 48, fits: true, estColdStartSec: 156, current: true }], idleTimeoutChoices: [30, 60] }
+  assert.equal(ProvisionProposalSchema.safeParse(proposal).success, true)
+  const confirmInput = RunpodRpc.methods.confirm.input
+  assert.equal(confirmInput.safeParse({ requestID: "r1", accepted: true, overrides: { gpu: "AMPERE_80", idleTimeout: 60 } }).success, true)
+  assert.equal(confirmInput.safeParse({ requestID: "r1", accepted: false }).success, true)
+  assert.equal(confirmInput.safeParse({ requestID: "r1" }).success, false)
 })
 ```
 
@@ -3363,9 +4134,11 @@ test("schemas accept well-formed payloads and reject bad phases", () => {
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { footerLabel, formatDuration, formatQuote, formatStatus, formatUsd, phaseLabel } from "../src/adapters/driving/rpc/format.ts"
+import { footerLabel, formatDuration, formatGpuOption, formatIdleChoice, formatModel, formatQuote, formatStatus, formatUsd, phaseLabel } from "../src/adapters/driving/rpc/format.ts"
 import type { StateEvent, StatusReport } from "../src/core/domain/events.ts"
+import type { GpuOption } from "../src/core/domain/provision.ts"
 import type { Quote } from "../src/core/domain/quote.ts"
+import { sampleModel } from "./fakes/fixtures.ts"
 
 const quote: Quote = { modelID: "m", hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", gpuCount: 1, ratePerHour: 1.22, rateSource: "catalog", weightsGb: 31.6, estColdStartSec: 156, idleTimeout: 120, idleWindowUsd: 0.0407, warnings: ["weights ≈31.6 GB may not fit 24 GB of VRAM"], blocked: null }
 const event: StateEvent = { modelID: "m", phase: "ready", detail: null, elapsedSec: 142, spendUsd: 0.4211, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB" }
@@ -3388,6 +4161,15 @@ test("formatQuote lists model, GPU rate, cold start, idle window and warnings", 
   assert.match(formatQuote({ ...quote, gpuCount: 2, rateSource: "fallback", weightsGb: null }), /×2 at .*\(static price table\)/)
 })
 
+test("formatGpuOption and formatIdleChoice", () => {
+  const option: GpuOption = { pool: "AMPERE_48", label: "A6000/A40 48GB", ratePerHour: 1.22, rateSource: "catalog", vramGb: 48, fits: true, estColdStartSec: 156, current: true }
+  assert.equal(formatGpuOption(option), "A6000/A40 48GB — $1.22/h · fits · cold start ≈ 2m 36s · current")
+  assert.equal(formatGpuOption({ ...option, fits: false, current: false, rateSource: "fallback" }), "A6000/A40 48GB — $1.22/h (static price) · too small · cold start ≈ 2m 36s")
+  assert.equal(formatGpuOption({ ...option, fits: null, current: false }), "A6000/A40 48GB — $1.22/h · fit unknown · cold start ≈ 2m 36s")
+  assert.equal(formatIdleChoice(120, 1.22), "120s ≈ $0.04 per idle window")
+  assert.equal(formatIdleChoice(1800, 2.72), "30m 0s ≈ $1.36 per idle window")
+})
+
 test("phaseLabel and footerLabel", () => {
   assert.equal(phaseLabel({ phase: "ready", elapsedSec: null }), "warm")
   assert.equal(phaseLabel({ phase: "warming", elapsedSec: 87 }), "warming 87s")
@@ -3397,7 +4179,7 @@ test("phaseLabel and footerLabel", () => {
   assert.equal(footerLabel(event), "runpod A6000/A40 48GB · warm · $1.22/h · ≈$0.42")
 })
 
-test("formatStatus prints one line per model plus orphans", () => {
+test("formatStatus prints one line per model plus orphans; formatModel prints the effective config", () => {
   const status: StatusReport = {
     models: [
       { modelID: "m", phase: "ready", detail: "ready in 142s", spendUsd: 0.42, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", endpointID: "ep1", gpuCount: 1, billedUsd: 0.5, lastRequestAt: 1 },
@@ -3409,7 +4191,8 @@ test("formatStatus prints one line per model plus orphans", () => {
   assert.equal(lines[0], "m: ready [ep1] · A6000/A40 48GB $1.22/h · session ≈$0.42 · billed $0.50 · ready in 142s")
   assert.equal(lines[1], "n: cold · A100 80GB ×2 $2.72/h · session ≈$0.00")
   assert.equal(lines[2], "Unmanaged oc-runpod-* endpoints: oc-runpod-old [epX]")
-  assert.equal(formatStatus({ models: [], orphans: [] }), "RunPod: no models configured (options.models)")
+  assert.equal(formatStatus({ models: [], orphans: [] }), "RunPod: no models configured (options.models or /runpod-add)")
+  assert.equal(formatModel(sampleModel({ idleTimeout: 60, toolParser: null })), "m: hf=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 gpu=AMPERE_48 gpuCount=1 context=65536 output=8192 tools=true family=auto toolParser=null reasoningParser=preset quantization=fp8 weightsGb=auto idleTimeout=60")
 })
 ```
 
@@ -3423,11 +4206,13 @@ Expected: FAIL — cannot find `rpc.ts` / `format.ts`.
 ```ts
 import type { Rpc } from "@opencode/plugin/rpc"
 import { z } from "zod"
-import type { ModelStatus, NoticeLevel, StateEvent, StatusReport } from "../../../core/domain/events.ts"
 import type { Phase } from "../../../core/domain/endpoint.ts"
+import type { ModelStatus, NoticeLevel, StateEvent, StatusReport } from "../../../core/domain/events.ts"
+import type { GpuOption, ProvisionOverrides, ProvisionProposal } from "../../../core/domain/provision.ts"
 import type { Quote } from "../../../core/domain/quote.ts"
 
 export const PhaseSchema: z.ZodType<Phase> = z.enum(["cold", "confirming", "creating", "warming", "ready", "idle", "deleting", "error"])
+const RateSourceSchema = z.enum(["catalog", "fallback"])
 
 export const QuoteSchema: z.ZodType<Quote> = z.object({
   modelID: z.string(),
@@ -3436,13 +4221,35 @@ export const QuoteSchema: z.ZodType<Quote> = z.object({
   gpuLabel: z.string(),
   gpuCount: z.number().int().min(1),
   ratePerHour: z.number(),
-  rateSource: z.enum(["catalog", "fallback"]),
+  rateSource: RateSourceSchema,
   weightsGb: z.number().nullable(),
   estColdStartSec: z.number(),
   idleTimeout: z.number(),
   idleWindowUsd: z.number(),
   warnings: z.array(z.string()),
   blocked: z.string().nullable(),
+})
+
+export const GpuOptionSchema: z.ZodType<GpuOption> = z.object({
+  pool: z.string(),
+  label: z.string(),
+  ratePerHour: z.number(),
+  rateSource: RateSourceSchema,
+  vramGb: z.number().nullable(),
+  fits: z.boolean().nullable(),
+  estColdStartSec: z.number(),
+  current: z.boolean(),
+})
+
+export const ProvisionProposalSchema: z.ZodType<ProvisionProposal> = z.object({
+  quote: QuoteSchema,
+  gpuOptions: z.array(GpuOptionSchema),
+  idleTimeoutChoices: z.array(z.number()),
+})
+
+export const ProvisionOverridesSchema: z.ZodType<ProvisionOverrides> = z.object({
+  gpu: z.string().optional(),
+  idleTimeout: z.number().int().optional(),
 })
 
 export const StateEventSchema: z.ZodType<StateEvent> = z.object({
@@ -3486,10 +4293,13 @@ export const RunpodRpc = {
     status: { input: z.object({}), output: StatusReportSchema },
     up: { input: z.object({ modelID: z.string() }), output: z.object({ baseURL: z.string() }) },
     down: { input: z.object({ modelID: z.string().optional() }), output: z.object({ deleted: z.array(z.string()) }) },
-    confirm: { input: z.object({ requestID: z.string(), accepted: z.boolean() }), output: z.object({ ok: z.boolean() }) },
+    confirm: {
+      input: z.object({ requestID: z.string(), accepted: z.boolean(), overrides: ProvisionOverridesSchema.optional() }),
+      output: z.object({ ok: z.boolean() }),
+    },
   },
   events: {
-    "confirm.requested": { schema: z.object({ requestID: z.string(), quote: QuoteSchema }) },
+    "confirm.requested": { schema: z.object({ requestID: z.string(), proposal: ProvisionProposalSchema }) },
     state: { schema: StateEventSchema },
     notice: { schema: NoticeSchema },
   },
@@ -3508,7 +4318,9 @@ export * from "./src/adapters/driving/rpc/contract.ts"
 ```ts
 import type { Phase } from "../../../core/domain/endpoint.ts"
 import type { StateEvent, StatusReport } from "../../../core/domain/events.ts"
-import type { Quote } from "../../../core/domain/quote.ts"
+import type { ModelConfig } from "../../../core/domain/model.ts"
+import type { GpuOption } from "../../../core/domain/provision.ts"
+import { idleWindowUsd, type Quote } from "../../../core/domain/quote.ts"
 
 export function formatUsd(usd: number): string {
   return `$${usd.toFixed(2)}`
@@ -3529,6 +4341,17 @@ export function formatQuote(q: Quote): string {
   ]
   for (const warning of q.warnings) lines.push(`Warning: ${warning}`)
   return lines.join("\n")
+}
+
+export function formatGpuOption(o: GpuOption): string {
+  const fit = o.fits === null ? "fit unknown" : o.fits ? "fits" : "too small"
+  const parts = [`${o.label} — ${formatUsd(o.ratePerHour)}/h${o.rateSource === "fallback" ? " (static price)" : ""}`, fit, `cold start ≈ ${formatDuration(o.estColdStartSec)}`]
+  if (o.current) parts.push("current")
+  return parts.join(" · ")
+}
+
+export function formatIdleChoice(seconds: number, ratePerHour: number): string {
+  return `${formatDuration(seconds)} ≈ ${formatUsd(idleWindowUsd(ratePerHour, seconds))} per idle window`
 }
 
 const PHASE_LABELS: Record<Phase, string> = {
@@ -3552,7 +4375,7 @@ export function footerLabel(e: StateEvent | null): string {
 }
 
 export function formatStatus(s: StatusReport): string {
-  if (s.models.length === 0) return "RunPod: no models configured (options.models)"
+  if (s.models.length === 0) return "RunPod: no models configured (options.models or /runpod-add)"
   const lines = s.models.map((m) => {
     const parts = [
       `${m.modelID}: ${m.phase}${m.endpointID ? ` [${m.endpointID}]` : ""}`,
@@ -3566,30 +4389,49 @@ export function formatStatus(s: StatusReport): string {
   if (s.orphans.length > 0) lines.push(`Unmanaged oc-runpod-* endpoints: ${s.orphans.map((o) => `${o.name} [${o.id}]`).join(", ")}`)
   return lines.join("\n")
 }
+
+/** One-line effective configuration, used by /runpod-add, /runpod-set and /runpod-remove replies. */
+export function formatModel(m: ModelConfig): string {
+  const tri = (v: string | null | undefined) => (v === undefined ? "preset" : v === null ? "null" : v)
+  return [
+    `${m.id}: hf=${m.hf}`,
+    `gpu=${m.gpu}`,
+    `gpuCount=${m.gpuCount}`,
+    `context=${m.context}`,
+    `output=${m.output}`,
+    `tools=${m.tools}`,
+    `family=${m.family ?? "auto"}`,
+    `toolParser=${tri(m.toolParser)}`,
+    `reasoningParser=${tri(m.reasoningParser)}`,
+    `quantization=${m.quantization ?? "null"}`,
+    `weightsGb=${m.weightsGb ?? "auto"}`,
+    `idleTimeout=${m.idleTimeout ?? "default"}`,
+  ].join(" ")
+}
 ```
 
 - [ ] **Step 5: Run tests and typecheck**
 
 Run: `npm run check`
-Expected: pass. The `z.ZodType<Quote>` annotations fail typecheck if the DTO drifts from the domain type — that is intended.
+Expected: pass. The `z.ZodType<…>` annotations fail typecheck if a DTO drifts from its domain type — intended.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add rpc.ts src/adapters/driving/rpc test/rpc-contract.test.ts test/format.test.ts
-git commit -m "feat(rpc): typed RPC contract and text formatting for quotes, status and footer"
+git commit -m "feat(rpc): typed RPC contract with provision proposals and text formatting"
 ```
 
 ---
 
-### Task 11: opencode and system driven adapters (state store, notifier, confirmation, clock, logger)
+### Task 11: opencode and system driven adapters (state store, notifier, confirmation, catalog publisher, clock, logger)
 
 **Files:**
-- Create: `src/adapters/driven/opencode/state-store.ts`, `notifier.ts`, `confirmation.ts`; `src/adapters/driven/system/clock.ts`, `logger.ts`
+- Create: `src/adapters/driven/opencode/state-store.ts`, `notifier.ts`, `confirmation.ts`, `catalog-publisher.ts`; `src/adapters/driven/system/clock.ts`, `logger.ts`
 - Test: `test/opencode-adapters.test.ts`
 
 **Interfaces:**
-- Produces: `class OpencodeStateStore implements StateStorePort { constructor(storage: { get(key): Promise<unknown>; set(key, value): Promise<void>; remove(key): Promise<void> }) }`; `class RpcNotifier implements NotifierPort { constructor(emit: { state(event: StateEvent): void; notice(level: NoticeLevel, message: string): void }) }`; `class ConfirmBroker { constructor(timeoutMs, timers?); request(issue: (requestID) => void): Promise<boolean>; resolve(requestID, accepted): boolean; readonly size }`; `class RpcConfirmation implements ConfirmationPort { constructor(broker: ConfirmBroker, emit: (requestID: string, quote: Quote) => void) }`; `class SystemClock implements ClockPort`; `class ConsoleLogger implements LoggerPort { constructor(prefix: string) }`.
+- Produces: `interface OpencodeStorageLike { get; set; remove; scan({ prefix, after?, limit? }) → { entries: { key; value }[]; next? } }`, `class OpencodeStateStore implements StateStorePort { constructor(storage: OpencodeStorageLike) }`; `class RpcNotifier implements NotifierPort { constructor(emit: { state(event): void; notice(level, message): void }) }`; `class ConfirmBroker { constructor(timeoutMs, timers?); request(issue: (requestID) => void): Promise<ProvisionDecision>; resolve(requestID, decision): boolean; readonly size }`; `class RpcConfirmation implements ConfirmationPort { constructor(broker, emit: (requestID: string, proposal: ProvisionProposal) => void) }`; `class OpencodeCatalogPublisher implements CatalogPublisherPort { constructor(reload: () => Promise<void>); readonly current: readonly PublishedModel[] }`; `class SystemClock implements ClockPort`; `class ConsoleLogger implements LoggerPort { constructor(prefix, write?) }`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3597,12 +4439,15 @@ git commit -m "feat(rpc): typed RPC contract and text formatting for quotes, sta
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { OpencodeCatalogPublisher } from "../src/adapters/driven/opencode/catalog-publisher.ts"
 import { ConfirmBroker, RpcConfirmation } from "../src/adapters/driven/opencode/confirmation.ts"
 import { RpcNotifier } from "../src/adapters/driven/opencode/notifier.ts"
 import { OpencodeStateStore } from "../src/adapters/driven/opencode/state-store.ts"
 import { SystemClock } from "../src/adapters/driven/system/clock.ts"
 import { ConsoleLogger } from "../src/adapters/driven/system/logger.ts"
+import type { ProvisionProposal } from "../src/core/domain/provision.ts"
 import type { Quote } from "../src/core/domain/quote.ts"
+import { sampleModel } from "./fakes/fixtures.ts"
 
 function timers() {
   const pending: { id: number; fn: () => void }[] = []
@@ -3616,40 +4461,41 @@ function timers() {
 }
 
 const quote: Quote = { modelID: "m", hf: "a/b", gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", gpuCount: 1, ratePerHour: 1.22, rateSource: "catalog", weightsGb: 10, estColdStartSec: 80, idleTimeout: 120, idleWindowUsd: 0.04, warnings: [], blocked: null }
+const proposal: ProvisionProposal = { quote, gpuOptions: [], idleTimeoutChoices: [30, 60] }
 
-test("ConfirmBroker: accept, decline, unknown id, timeout", async () => {
+test("ConfirmBroker: accept with overrides, decline, unknown id, timeout", async () => {
   const t = timers()
   const broker = new ConfirmBroker(1000, t)
   let issued = ""
   const accepted = broker.request((id) => { issued = id })
   assert.ok(issued.length > 0)
   assert.equal(broker.size, 1)
-  assert.equal(broker.resolve("nope", true), false)
-  assert.equal(broker.resolve(issued, true), true)
-  assert.equal(await accepted, true)
+  assert.equal(broker.resolve("nope", { accepted: true, overrides: {} }), false)
+  assert.equal(broker.resolve(issued, { accepted: true, overrides: { gpu: "AMPERE_80" } }), true)
+  assert.deepEqual(await accepted, { accepted: true, overrides: { gpu: "AMPERE_80" } })
   assert.equal(broker.size, 0)
   assert.equal(t.pending.length, 0)
 
   const declined = broker.request((id) => { issued = id })
-  broker.resolve(issued, false)
-  assert.equal(await declined, false)
+  broker.resolve(issued, { accepted: false })
+  assert.deepEqual(await declined, { accepted: false })
 
   const timedOut = broker.request((id) => { issued = id })
   t.fire()
-  assert.equal(await timedOut, false)
-  assert.equal(broker.resolve(issued, true), false)
+  assert.deepEqual(await timedOut, { accepted: false })
+  assert.equal(broker.resolve(issued, { accepted: true, overrides: {} }), false)
 })
 
-test("RpcConfirmation emits the quote with the request id and resolves through the broker", async () => {
+test("RpcConfirmation emits the proposal with the request id and resolves through the broker", async () => {
   const t = timers()
   const broker = new ConfirmBroker(1000, t)
-  const emitted: { requestID: string; quote: Quote }[] = []
-  const confirmation = new RpcConfirmation(broker, (requestID, q) => { emitted.push({ requestID, quote: q }) })
-  const pending = confirmation.ask(quote)
+  const emitted: { requestID: string; proposal: ProvisionProposal }[] = []
+  const confirmation = new RpcConfirmation(broker, (requestID, p) => { emitted.push({ requestID, proposal: p }) })
+  const pending = confirmation.ask(proposal)
   assert.equal(emitted.length, 1)
-  assert.equal(emitted[0]!.quote, quote)
-  assert.equal(broker.resolve(emitted[0]!.requestID, true), true)
-  assert.equal(await pending, true)
+  assert.equal(emitted[0]!.proposal, proposal)
+  assert.equal(broker.resolve(emitted[0]!.requestID, { accepted: true, overrides: { idleTimeout: 60 } }), true)
+  assert.deepEqual(await pending, { accepted: true, overrides: { idleTimeout: 60 } })
 })
 
 test("RpcNotifier forwards state and notices", () => {
@@ -3660,17 +4506,45 @@ test("RpcNotifier forwards state and notices", () => {
   assert.deepEqual(seen, ["state:ready", "warning:careful"])
 })
 
-test("OpencodeStateStore passes through to ctx.storage", async () => {
+test("OpencodeCatalogPublisher keeps the latest list (copied) and triggers a provider reload", async () => {
+  let reloads = 0
+  const publisher = new OpencodeCatalogPublisher(async () => { reloads++ })
+  assert.deepEqual(publisher.current, [])
+  publisher.seed([{ config: sampleModel({ id: "seeded" }), variants: [] }])
+  assert.equal(reloads, 0)
+  assert.equal(publisher.current[0]!.config.id, "seeded")
+  const model = sampleModel()
+  await publisher.publish([{ config: model, variants: ["AMPERE_48", "AMPERE_80"] }])
+  assert.equal(reloads, 1)
+  assert.equal(publisher.current.length, 1)
+  assert.deepEqual(publisher.current[0]!.variants, ["AMPERE_48", "AMPERE_80"])
+  model.gpu = "CHANGED"
+  assert.equal(publisher.current[0]!.config.gpu, "AMPERE_48")
+})
+
+test("OpencodeStateStore passes through to ctx.storage and lists keys across scan pages", async () => {
   const backing = new Map<string, unknown>()
   const store = new OpencodeStateStore({
     get: async (key) => backing.get(key),
     set: async (key, value) => { backing.set(key, value) },
     remove: async (key) => { backing.delete(key) },
+    scan: async ({ prefix, after, limit }) => {
+      const keys = [...backing.keys()].filter((k) => k.startsWith(prefix)).sort()
+      const start = after ? keys.indexOf(after) + 1 : 0
+      const page = keys.slice(start, start + (limit ?? 100))
+      const next = start + page.length < keys.length ? page.at(-1) : undefined
+      return { entries: page.map((key) => ({ key, value: backing.get(key) })), next }
+    },
   })
-  await store.set("k", { a: 1 })
-  assert.deepEqual(await store.get<{ a: number }>("k"), { a: 1 })
-  await store.remove("k")
-  assert.equal(await store.get("k"), undefined)
+  await store.set("models/a", { a: 1 })
+  await store.set("models/b", { b: 2 })
+  await store.set("models/c", { c: 3 })
+  await store.set("other/x", 1)
+  assert.deepEqual(await store.get<{ a: number }>("models/a"), { a: 1 })
+  assert.deepEqual(await store.keys("models/"), ["models/a", "models/b", "models/c"])
+  await store.remove("models/a")
+  assert.equal(await store.get("models/a"), undefined)
+  assert.deepEqual(await store.keys("models/"), ["models/b", "models/c"])
 })
 
 test("SystemClock and ConsoleLogger are usable", async () => {
@@ -3699,11 +4573,21 @@ Expected: FAIL — modules not found.
 ```ts
 import type { StateStorePort } from "../../../core/ports/state-store.ts"
 
+/** The subset of `ctx.storage` this adapter needs. */
+export interface OpencodeStorageLike {
+  get(key: string): Promise<unknown>
+  set(key: string, value: unknown): Promise<void>
+  remove(key: string): Promise<void>
+  scan(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries: readonly { key: string; value: unknown }[]; next?: string }>
+}
+
+const PAGE_SIZE = 100
+
 /** Adapts `ctx.storage` (durable, plugin-scoped JSON) to the StateStorePort. */
 export class OpencodeStateStore implements StateStorePort {
-  private readonly storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void>; remove(key: string): Promise<void> }
+  private readonly storage: OpencodeStorageLike
 
-  constructor(storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void>; remove(key: string): Promise<void> }) {
+  constructor(storage: OpencodeStorageLike) {
     this.storage = storage
   }
 
@@ -3718,8 +4602,20 @@ export class OpencodeStateStore implements StateStorePort {
   remove(key: string): Promise<void> {
     return this.storage.remove(key)
   }
+
+  async keys(prefix: string): Promise<string[]> {
+    const out: string[] = []
+    let after: string | undefined
+    do {
+      const page = await this.storage.scan({ prefix, after, limit: PAGE_SIZE })
+      out.push(...page.entries.map((e) => e.key))
+      after = page.next
+    } while (after)
+    return out.sort()
+  }
 }
 ```
+
 `src/adapters/driven/opencode/notifier.ts`:
 ```ts
 import type { NoticeLevel, StateEvent } from "../../../core/domain/events.ts"
@@ -3751,11 +4647,11 @@ export class RpcNotifier implements NotifierPort {
 `src/adapters/driven/opencode/confirmation.ts`:
 ```ts
 import { randomUUID } from "node:crypto"
-import type { Quote } from "../../../core/domain/quote.ts"
+import type { ProvisionDecision, ProvisionProposal } from "../../../core/domain/provision.ts"
 import type { ConfirmationPort } from "../../../core/ports/confirmation.ts"
 
 interface Pending {
-  resolve: (accepted: boolean) => void
+  resolve: (decision: ProvisionDecision) => void
   timer: unknown
 }
 
@@ -3764,7 +4660,7 @@ export interface ConfirmTimers {
   clearTimer?: (id: unknown) => void
 }
 
-/** Pairs an outgoing "please confirm" request with the reply that arrives later over RPC. */
+/** Pairs an outgoing "please decide" request with the reply that arrives later over RPC. */
 export class ConfirmBroker {
   private readonly timeoutMs: number
   private readonly setTimer: (fn: () => void, ms: number) => unknown
@@ -3777,24 +4673,24 @@ export class ConfirmBroker {
     this.clearTimer = timers.clearTimer ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>))
   }
 
-  request(issue: (requestID: string) => void): Promise<boolean> {
+  request(issue: (requestID: string) => void): Promise<ProvisionDecision> {
     const requestID = randomUUID()
-    return new Promise<boolean>((resolve) => {
+    return new Promise<ProvisionDecision>((resolve) => {
       const timer = this.setTimer(() => {
         this.pending.delete(requestID)
-        resolve(false)
+        resolve({ accepted: false })
       }, this.timeoutMs)
       this.pending.set(requestID, { resolve, timer })
       issue(requestID)
     })
   }
 
-  resolve(requestID: string, accepted: boolean): boolean {
+  resolve(requestID: string, decision: ProvisionDecision): boolean {
     const entry = this.pending.get(requestID)
     if (!entry) return false
     this.pending.delete(requestID)
     this.clearTimer(entry.timer)
-    entry.resolve(accepted)
+    entry.resolve(decision)
     return true
   }
 
@@ -3806,16 +4702,52 @@ export class ConfirmBroker {
 /** ConfirmationPort over RPC: emit `confirm.requested`, wait for the `confirm` method to answer. */
 export class RpcConfirmation implements ConfirmationPort {
   private readonly broker: ConfirmBroker
-  private readonly emit: (requestID: string, quote: Quote) => void
+  private readonly emit: (requestID: string, proposal: ProvisionProposal) => void
 
-  constructor(broker: ConfirmBroker, emit: (requestID: string, quote: Quote) => void) {
+  constructor(broker: ConfirmBroker, emit: (requestID: string, proposal: ProvisionProposal) => void) {
     this.broker = broker
     this.emit = emit
   }
 
-  ask(quote: Quote): Promise<boolean> {
-    return this.broker.request((requestID) => this.emit(requestID, quote))
+  ask(proposal: ProvisionProposal): Promise<ProvisionDecision> {
+    return this.broker.request((requestID) => this.emit(requestID, proposal))
   }
+}
+```
+
+`src/adapters/driven/opencode/catalog-publisher.ts`:
+```ts
+import type { CatalogPublisherPort, PublishedModel } from "../../../core/ports/catalog-publisher.ts"
+
+/**
+ * Holds the effective model list for the provider transform (which the composition root registers)
+ * and asks opencode to re-run its provider transforms whenever the list changes.
+ */
+export class OpencodeCatalogPublisher implements CatalogPublisherPort {
+  private models: PublishedModel[] = []
+  private readonly reload: () => Promise<void>
+
+  constructor(reload: () => Promise<void>) {
+    this.reload = reload
+  }
+
+  get current(): readonly PublishedModel[] {
+    return this.models
+  }
+
+  /** Sets the list without a reload; used once before the provider transform is registered. */
+  seed(models: readonly PublishedModel[]): void {
+    this.models = copy(models)
+  }
+
+  async publish(models: readonly PublishedModel[]): Promise<void> {
+    this.models = copy(models)
+    await this.reload()
+  }
+}
+
+function copy(models: readonly PublishedModel[]): PublishedModel[] {
+  return models.map((m) => ({ config: { ...m.config, env: { ...m.config.env } }, variants: [...m.variants] }))
 }
 ```
 
@@ -3876,20 +4808,20 @@ Expected: pass.
 
 ```bash
 git add src/adapters/driven/opencode src/adapters/driven/system test/opencode-adapters.test.ts
-git commit -m "feat(adapters): opencode storage/RPC notifier/confirmation and system clock/logger"
+git commit -m "feat(adapters): opencode storage/RPC/catalog adapters and system clock/logger"
 ```
 
 ---
 
-### Task 12: Options resolution (driving adapter: opencode config → Settings + secrets)
+### Task 12: Options resolution and `key=value` override parsing (driving adapter)
 
 **Files:**
 - Create: `src/adapters/driving/opencode/config.ts`
 - Test: `test/config.test.ts`
 
 **Interfaces:**
-- Consumes: `ModelConfig`, `Settings` (core).
-- Produces: `OptionsSchema`, `ModelOptionsSchema`, `class ConfigError`, `resolveSecret(value, deps)`, `resolveSettings(raw: unknown, deps: { env?; readFile?; knownPools: readonly string[] }): { settings: Settings; secrets: { apiKey: string | null; hfToken: string | null } }`.
+- Consumes: `ModelConfig`, `ModelOverrides`, `Settings`, `MODEL_ID_PATTERN` (core).
+- Produces: `OptionsSchema`, `ModelOptionsSchema`, `OverridesSchema`, `OVERRIDE_KEYS`, `class ConfigError`, `resolveSecret(value, deps)`, `resolveSettings(raw, deps: { env?; readFile?; knownPools }): { settings; secrets: { apiKey; hfToken } }`, `parseOverrides(pairs: readonly string[]): ModelOverrides`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3897,14 +4829,14 @@ git commit -m "feat(adapters): opencode storage/RPC notifier/confirmation and sy
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { ConfigError, resolveSecret, resolveSettings } from "../src/adapters/driving/opencode/config.ts"
+import { ConfigError, OVERRIDE_KEYS, parseOverrides, resolveSecret, resolveSettings } from "../src/adapters/driving/opencode/config.ts"
 
 const POOLS = ["AMPERE_16", "ADA_24", "AMPERE_48", "AMPERE_80"]
 const resolve = (raw: unknown, env: Record<string, string> = {}) => resolveSettings(raw, { env, knownPools: POOLS })
 
-test("defaults are applied; models keep tri-state parsers for the recipe adapter", () => {
+test("defaults are applied; models keep tri-state parsers and a per-model idle timeout", () => {
   const { settings, secrets } = resolve(
-    { models: { "qwen3-coder-30b": { hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", quantization: "fp8" } } },
+    { models: { "qwen3-coder-30b": { hf: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8", gpu: "AMPERE_48", quantization: "fp8" }, short: { hf: "Qwen/Qwen3-8B", gpu: "ADA_24", idleTimeout: 45 } } },
     { RUNPOD_API_KEY: "rp_test" },
   )
   assert.equal(secrets.apiKey, "rp_test")
@@ -3915,26 +4847,28 @@ test("defaults are applied; models keep tri-state parsers for the recipe adapter
   assert.equal(settings.workersMax, 1)
   assert.equal(settings.executionTimeoutSec, 600)
   assert.equal(settings.coldStartTimeoutSec, 600)
-  assert.equal(settings.deleteOnExit, true)
+  assert.equal(settings.deleteOnExit, false)
   assert.equal(settings.adoptExisting, true)
   assert.equal(settings.maxHourlyRate, null)
   assert.deepEqual(settings.dataCenterIds, [])
   assert.equal(settings.minCudaVersion, "12.8")
   assert.equal(settings.workerImage, "runpod/worker-v1-vllm:v2.27.2")
   assert.equal(settings.flashboot, true)
-  const m = settings.models[0]!
-  assert.equal(m.id, "qwen3-coder-30b")
-  assert.equal(m.name, "qwen3-coder-30b (RunPod)")
-  assert.equal(m.family, null)
-  assert.equal(m.toolParser, undefined)
-  assert.equal(m.reasoningParser, undefined)
-  assert.equal(m.quantization, "fp8")
-  assert.equal(m.context, 32768)
-  assert.equal(m.output, 8192)
-  assert.equal(m.gpuCount, 1)
-  assert.equal(m.tools, true)
-  assert.equal(m.weightsGb, null)
-  assert.deepEqual(m.env, {})
+  const [m, short] = settings.models
+  assert.equal(m!.id, "qwen3-coder-30b")
+  assert.equal(m!.name, "qwen3-coder-30b (RunPod)")
+  assert.equal(m!.family, null)
+  assert.equal(m!.toolParser, undefined)
+  assert.equal(m!.reasoningParser, undefined)
+  assert.equal(m!.quantization, "fp8")
+  assert.equal(m!.context, 32768)
+  assert.equal(m!.output, 8192)
+  assert.equal(m!.gpuCount, 1)
+  assert.equal(m!.tools, true)
+  assert.equal(m!.weightsGb, null)
+  assert.equal(m!.idleTimeout, null)
+  assert.deepEqual(m!.env, {})
+  assert.equal(short!.idleTimeout, 45)
   assert.ok(!("apiKey" in settings))
 })
 
@@ -3945,10 +4879,11 @@ test("unknown gpu pool is a ConfigError naming the key and listing known pools",
   )
 })
 
-test("unknown option keys, bad model ids and bad HF ids are rejected", () => {
+test("unknown option keys, bad model ids, bad HF ids and out-of-range idle timeouts are rejected", () => {
   assert.throws(() => resolve({ bogus: 1 }), ConfigError)
   assert.throws(() => resolve({ models: { "Bad Id": { hf: "a/b", gpu: "ADA_24" } } }), /id must match/)
   assert.throws(() => resolve({ models: { ok: { hf: "not-a-repo", gpu: "ADA_24" } } }), /hf/)
+  assert.throws(() => resolve({ models: { ok: { hf: "a/b", gpu: "ADA_24", idleTimeout: 0 } } }), /idleTimeout/)
 })
 
 test("secret placeholders resolve from env and file; missing values become null", () => {
@@ -3972,6 +4907,30 @@ test("explicit parser values and family are preserved (null and strings)", () =>
   assert.equal(m.family, "qwen3")
   assert.deepEqual(m.env, { GPU_MEMORY_UTILIZATION: "0.9" })
 })
+
+test("parseOverrides coerces key=value pairs into typed overrides", () => {
+  assert.deepEqual(parseOverrides(["gpu=AMPERE_80", "context=8192", "tools=false", "toolParser=null", "idleTimeout=60", "weightsGb=12.5", "name=My Model"]), {
+    gpu: "AMPERE_80",
+    context: 8192,
+    tools: false,
+    toolParser: null,
+    idleTimeout: 60,
+    weightsGb: 12.5,
+    name: "My Model",
+  })
+  assert.deepEqual(parseOverrides([]), {})
+  assert.deepEqual(OVERRIDE_KEYS, ["name", "hf", "gpu", "gpuCount", "context", "output", "tools", "family", "toolParser", "reasoningParser", "quantization", "weightsGb", "idleTimeout"])
+})
+
+test("parseOverrides rejects malformed pairs, unknown keys and bad values with the reason", () => {
+  assert.throws(() => parseOverrides(["gpu"]), /expected key=value, got "gpu"/)
+  assert.throws(() => parseOverrides(["bogus=1"]), /unknown key "bogus" \(allowed: name, hf, gpu/)
+  assert.throws(() => parseOverrides(["context=lots"]), /context: expected a number, got "lots"/)
+  assert.throws(() => parseOverrides(["tools=yes"]), /tools: expected true or false/)
+  assert.throws(() => parseOverrides(["gpu=null"]), /gpu cannot be null/)
+  assert.throws(() => parseOverrides(["context=100"]), /context/)
+  assert.throws(() => parseOverrides(["hf=not-a-repo"]), /hf/)
+})
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -3984,9 +4943,8 @@ Expected: FAIL — cannot find `config.ts`.
 ```ts
 import { readFileSync } from "node:fs"
 import { z } from "zod"
-import type { ModelConfig, Settings } from "../../../core/domain/model.ts"
+import { MODEL_ID_PATTERN, type ModelConfig, type ModelOverrides, type Settings } from "../../../core/domain/model.ts"
 
-const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,62}$/
 const HF_REPO = /^[\w.-]+\/[\w.-]+$/
 
 export const ModelOptionsSchema = z.strictObject({
@@ -4002,6 +4960,7 @@ export const ModelOptionsSchema = z.strictObject({
   reasoningParser: z.string().nullable().optional(),
   quantization: z.string().nullable().optional(),
   weightsGb: z.number().positive().nullable().optional(),
+  idleTimeout: z.number().int().min(1).max(3600).nullable().optional(),
   env: z.record(z.string(), z.string()).default({}),
 })
 
@@ -4014,7 +4973,7 @@ export const OptionsSchema = z.strictObject({
   workersMax: z.number().int().min(1).max(10).default(1),
   executionTimeoutSec: z.number().int().min(5).default(600),
   coldStartTimeoutSec: z.number().int().min(30).default(600),
-  deleteOnExit: z.boolean().default(true),
+  deleteOnExit: z.boolean().default(false),
   adoptExisting: z.boolean().default(true),
   maxHourlyRate: z.number().positive().optional(),
   dataCenterIds: z.array(z.string()).default([]),
@@ -4023,6 +4982,28 @@ export const OptionsSchema = z.strictObject({
   flashboot: z.boolean().default(true),
   models: z.record(z.string(), ModelOptionsSchema).default({}),
 })
+
+/** Runtime overrides (dialog, variants, /runpod-set): same fields, no defaults, `env` excluded. */
+export const OverridesSchema = z.strictObject({
+  name: z.string().min(1).optional(),
+  hf: z.string().regex(HF_REPO, "expected a Hugging Face repo id like org/name").optional(),
+  gpu: z.string().min(1).optional(),
+  gpuCount: z.number().int().min(1).max(8).optional(),
+  context: z.number().int().min(1024).optional(),
+  output: z.number().int().min(256).optional(),
+  tools: z.boolean().optional(),
+  family: z.string().nullable().optional(),
+  toolParser: z.string().nullable().optional(),
+  reasoningParser: z.string().nullable().optional(),
+  quantization: z.string().nullable().optional(),
+  weightsGb: z.number().positive().nullable().optional(),
+  idleTimeout: z.number().int().min(1).max(3600).nullable().optional(),
+})
+
+export const OVERRIDE_KEYS = ["name", "hf", "gpu", "gpuCount", "context", "output", "tools", "family", "toolParser", "reasoningParser", "quantization", "weightsGb", "idleTimeout"] as const
+const NUMERIC_KEYS = new Set<string>(["gpuCount", "context", "output", "weightsGb", "idleTimeout"])
+const BOOLEAN_KEYS = new Set<string>(["tools"])
+const NULLABLE_KEYS = new Set<string>(["family", "toolParser", "reasoningParser", "quantization", "weightsGb", "idleTimeout"])
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -4078,7 +5059,7 @@ export function resolveSettings(raw: unknown, deps: ResolveDeps): { settings: Se
   const o = parsed.data
   const models: ModelConfig[] = []
   for (const [id, m] of Object.entries(o.models)) {
-    if (!MODEL_ID.test(id)) throw new ConfigError(`models.${id}: id must match ${MODEL_ID}`)
+    if (!MODEL_ID_PATTERN.test(id)) throw new ConfigError(`models.${id}: id must match ${MODEL_ID_PATTERN}`)
     if (!deps.knownPools.includes(m.gpu)) {
       throw new ConfigError(`models.${id}.gpu: unknown pool "${m.gpu}" (known: ${deps.knownPools.join(", ")})`)
     }
@@ -4096,6 +5077,7 @@ export function resolveSettings(raw: unknown, deps: ResolveDeps): { settings: Se
       reasoningParser: m.reasoningParser,
       quantization: m.quantization ?? null,
       weightsGb: m.weightsGb ?? null,
+      idleTimeout: m.idleTimeout ?? null,
       env: { ...m.env },
     })
   }
@@ -4121,6 +5103,41 @@ export function resolveSettings(raw: unknown, deps: ResolveDeps): { settings: Se
   }
   return { settings, secrets }
 }
+
+/** Parses `/runpod-set` style `key=value` pairs; `null` clears a nullable key. */
+export function parseOverrides(pairs: readonly string[]): ModelOverrides {
+  const raw: Record<string, unknown> = {}
+  for (const pair of pairs) {
+    const eq = pair.indexOf("=")
+    if (eq <= 0) throw new ConfigError(`expected key=value, got "${pair}"`)
+    const key = pair.slice(0, eq)
+    const value = pair.slice(eq + 1)
+    if (!(OVERRIDE_KEYS as readonly string[]).includes(key)) throw new ConfigError(`unknown key "${key}" (allowed: ${OVERRIDE_KEYS.join(", ")})`)
+    if (value === "null") {
+      if (!NULLABLE_KEYS.has(key)) throw new ConfigError(`${key} cannot be null`)
+      raw[key] = null
+      continue
+    }
+    if (NUMERIC_KEYS.has(key)) {
+      const n = Number(value)
+      if (value.trim() === "" || !Number.isFinite(n)) throw new ConfigError(`${key}: expected a number, got "${value}"`)
+      raw[key] = n
+      continue
+    }
+    if (BOOLEAN_KEYS.has(key)) {
+      if (value !== "true" && value !== "false") throw new ConfigError(`${key}: expected true or false`)
+      raw[key] = value === "true"
+      continue
+    }
+    raw[key] = value
+  }
+  const parsed = OverridesSchema.safeParse(raw)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]!
+    throw new ConfigError(`${issue.path.join(".") || "override"}: ${issue.message}`)
+  }
+  return parsed.data as ModelOverrides
+}
 ```
 
 - [ ] **Step 4: Run tests and typecheck**
@@ -4132,20 +5149,20 @@ Expected: pass.
 
 ```bash
 git add src/adapters/driving/opencode/config.ts test/config.test.ts
-git commit -m "feat(opencode): resolve plugin options into domain settings and secrets"
+git commit -m "feat(opencode): resolve plugin options into settings and parse runtime key=value overrides"
 ```
 
 ---
 
-### Task 13: Provider/model catalog builders and slash commands
+### Task 13: Provider/model catalog builders (with variants) and slash commands
 
 **Files:**
 - Create: `src/adapters/driving/opencode/provider-catalog.ts`, `src/adapters/driving/opencode/commands.ts`
 - Test: `test/provider-catalog.test.ts`, `test/commands.test.ts`
 
 **Interfaces:**
-- Consumes: `ModelConfig`, `OperationsPort`, `StatusReport`, `formatStatus`.
-- Produces: `PROVIDER_ID = "runpod"`, `PROVIDER_NAME`, `PROVIDER_PACKAGE`, `PLACEHOLDER_BASE_URL`, `buildProviderInfo(apiKey: string | null): Provider.Info`, `buildModelInfo(model: ModelConfig): Model.Info`; `parseArg(text): string | null`, `registerCommands(host: CommandHost, ops: OperationsPort, reply: Reply): Promise<void>` where `CommandHost = { command: { transform(cb: (editor: { add(def: { name; description?; execute(input: { sessionID: string; prompt: { text: string } }): Promise<void> }): void }) => void): Promise<unknown> } }` and `Reply = (sessionID: string, text: string) => Promise<void>`.
+- Consumes: `ModelConfig`, `PublishedModel`, `OperationsPort`, `StatusReport`, `formatStatus`, `formatModel`, `parseOverrides`, `ConfigError`.
+- Produces: `PROVIDER_ID = "runpod"`, `PROVIDER_NAME`, `PROVIDER_PACKAGE`, `PLACEHOLDER_BASE_URL`, `buildProviderInfo(apiKey: string | null): Provider.Info`, `buildModelInfo(published: PublishedModel): Model.Info`; `parseArgs(text): string[]`, `registerCommands(host: CommandHost, ops: OperationsPort, reply: Reply): Promise<void>` where `CommandHost = { command: { transform(cb: (editor: { add(def: { name; description?; execute(input: { sessionID: string; prompt: { text: string } }): Promise<void> }): void }) => void): Promise<unknown> } }` and `Reply = (sessionID: string, text: string) => Promise<void>`. Commands: `runpod-status`, `runpod-up`, `runpod-down`, `runpod-add`, `runpod-set`, `runpod-remove`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4169,8 +5186,8 @@ test("provider info uses the openai-compatible package, placeholder URL and long
   assert.equal(buildProviderInfo(null).settings?.apiKey, "missing-runpod-api-key")
 })
 
-test("model info carries limits, tool capability and the model id as wire id", () => {
-  const model = buildModelInfo(sampleModel({ name: "M", context: 40000, output: 4000, tools: false }))
+test("model info carries limits, tool capability, the model id as wire id and GPU pools as variants", () => {
+  const model = buildModelInfo({ config: sampleModel({ name: "M", context: 40000, output: 4000, tools: false }), variants: ["AMPERE_48", "AMPERE_80"] })
   assert.equal(model.id, "m")
   assert.equal(model.modelID, "m")
   assert.equal(model.providerID, "runpod")
@@ -4181,6 +5198,7 @@ test("model info carries limits, tool capability and the model id as wire id", (
   assert.equal(model.limit.output, 4000)
   assert.equal(model.status, "active")
   assert.equal(model.enabled, true)
+  assert.deepEqual(model.variants.map((v) => v.id), ["AMPERE_48", "AMPERE_80"])
 })
 ```
 
@@ -4188,9 +5206,11 @@ test("model info carries limits, tool capability and the model id as wire id", (
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { parseArg, registerCommands, type CommandHost } from "../src/adapters/driving/opencode/commands.ts"
+import { parseArgs, registerCommands, type CommandHost } from "../src/adapters/driving/opencode/commands.ts"
 import type { StatusReport } from "../src/core/domain/events.ts"
+import type { ModelConfig } from "../src/core/domain/model.ts"
 import type { OperationsPort } from "../src/core/ports/driving.ts"
+import { sampleModel } from "./fakes/fixtures.ts"
 
 type Definition = { name: string; description?: string; execute(input: { sessionID: string; prompt: { text: string } }): Promise<void> }
 
@@ -4204,49 +5224,89 @@ const report: StatusReport = { models: [{ modelID: "m", phase: "ready", detail: 
 
 function ops(overrides: Partial<OperationsPort> = {}): OperationsPort & { calls: string[] } {
   const calls: string[] = []
+  const added: ModelConfig = sampleModel({ id: "qwen3-8b", hf: "Qwen/Qwen3-8B", quantization: null })
   return {
     calls,
     status: async () => { calls.push("status"); return report },
     up: async (modelID) => { calls.push(`up:${modelID}`); return `https://x/${modelID}/v1` },
     down: async (modelID) => { calls.push(`down:${modelID ?? "*"}`); return modelID ? [modelID] : ["m", "n"] },
+    add: async (input) => { calls.push(`add:${JSON.stringify(input)}`); return { ...added, gpu: input.gpu ?? "AMPERE_48", ...(input.overrides ?? {}) } },
+    set: async (modelID, o) => { calls.push(`set:${modelID}:${JSON.stringify(o)}`); return sampleModel({ ...o, id: modelID }) },
+    remove: async (modelID) => { calls.push(`remove:${modelID}`); return modelID === "m" ? "reset" : "removed" },
+    models: () => [sampleModel()],
     ...overrides,
   }
 }
 
-test("parseArg strips the command token and returns the first argument", () => {
-  assert.equal(parseArg("/runpod-up  my-model extra"), "my-model")
-  assert.equal(parseArg("my-model"), "my-model")
-  assert.equal(parseArg("/runpod-up"), null)
-  assert.equal(parseArg("   "), null)
+async function run(defs: Map<string, Definition>, name: string, text: string) {
+  await defs.get(name)!.execute({ sessionID: "s", prompt: { text } })
+}
+
+test("parseArgs strips the command token and splits on whitespace", () => {
+  assert.deepEqual(parseArgs("/runpod-add Qwen/Qwen3-8B  AMPERE_48 context=8192"), ["Qwen/Qwen3-8B", "AMPERE_48", "context=8192"])
+  assert.deepEqual(parseArgs("my-model"), ["my-model"])
+  assert.deepEqual(parseArgs("/runpod-up"), [])
+  assert.deepEqual(parseArgs("   "), [])
 })
 
-test("commands are registered and reply through the reply channel", async () => {
+test("status/up/down commands reply through the reply channel", async () => {
   const { h, defs } = host()
   const o = ops()
   const replies: string[] = []
   await registerCommands(h, o, async (_sessionID, text) => { replies.push(text) })
-  assert.deepEqual([...defs.keys()].sort(), ["runpod-down", "runpod-status", "runpod-up"])
-  await defs.get("runpod-status")!.execute({ sessionID: "s", prompt: { text: "" } })
+  assert.deepEqual([...defs.keys()].sort(), ["runpod-add", "runpod-down", "runpod-remove", "runpod-set", "runpod-status", "runpod-up"])
+  await run(defs, "runpod-status", "")
   assert.match(replies.at(-1)!, /^m: ready \[ep1\]/)
-  await defs.get("runpod-up")!.execute({ sessionID: "s", prompt: { text: "/runpod-up m" } })
+  await run(defs, "runpod-up", "/runpod-up m")
   assert.equal(replies.at(-1), "RunPod m is warm at https://x/m/v1")
-  await defs.get("runpod-up")!.execute({ sessionID: "s", prompt: { text: "" } })
+  await run(defs, "runpod-up", "")
   assert.equal(replies.at(-1), "Usage: /runpod-up <model-id>")
-  await defs.get("runpod-down")!.execute({ sessionID: "s", prompt: { text: "m" } })
+  await run(defs, "runpod-down", "m")
   assert.equal(replies.at(-1), "Deleted RunPod endpoint(s): m")
-  await defs.get("runpod-down")!.execute({ sessionID: "s", prompt: { text: "all" } })
+  await run(defs, "runpod-down", "all")
   assert.equal(replies.at(-1), "Deleted RunPod endpoint(s): m, n")
   assert.deepEqual(o.calls, ["status", "up:m", "down:m", "down:*"])
+})
+
+test("add/set/remove commands parse their arguments and describe the effective config", async () => {
+  const { h, defs } = host()
+  const o = ops()
+  const replies: string[] = []
+  await registerCommands(h, o, async (_s, text) => { replies.push(text) })
+  await run(defs, "runpod-add", "/runpod-add Qwen/Qwen3-8B AMPERE_80 context=8192 idleTimeout=60")
+  assert.equal(o.calls.at(-1), 'add:{"hf":"Qwen/Qwen3-8B","gpu":"AMPERE_80","overrides":{"context":8192,"idleTimeout":60}}')
+  assert.match(replies.at(-1)!, /^Added runpod\/qwen3-8b · qwen3-8b: hf=Qwen\/Qwen3-8B gpu=AMPERE_80 .*context=8192 .*idleTimeout=60\nSelect it in \/models; the first request shows the provision dialog\.$/)
+  await run(defs, "runpod-add", "/runpod-add Qwen/Qwen3-8B context=4096")
+  assert.equal(o.calls.at(-1), 'add:{"hf":"Qwen/Qwen3-8B","gpu":undefined,"overrides":{"context":4096}}'.replace('"gpu":undefined,', ""))
+  await run(defs, "runpod-add", "")
+  assert.equal(replies.at(-1), "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]")
+  await run(defs, "runpod-add", "not-a-repo")
+  assert.match(replies.at(-1)!, /hf/)
+  await run(defs, "runpod-set", "m gpu=AMPERE_80 idleTimeout=null")
+  assert.equal(o.calls.at(-1), 'set:m:{"gpu":"AMPERE_80","idleTimeout":null}')
+  assert.match(replies.at(-1)!, /^Updated m: hf=.* gpu=AMPERE_80/)
+  await run(defs, "runpod-set", "m")
+  assert.equal(replies.at(-1), "Usage: /runpod-set <model-id> key=value [key=value …] (keys: name, hf, gpu, gpuCount, context, output, tools, family, toolParser, reasoningParser, quantization, weightsGb, idleTimeout)")
+  await run(defs, "runpod-set", "m bogus=1")
+  assert.match(replies.at(-1)!, /unknown key "bogus"/)
+  await run(defs, "runpod-remove", "m")
+  assert.equal(replies.at(-1), "Reset runpod/m to its opencode.json configuration")
+  await run(defs, "runpod-remove", "qwen3-8b")
+  assert.equal(replies.at(-1), "Removed runpod/qwen3-8b")
+  await run(defs, "runpod-remove", "")
+  assert.equal(replies.at(-1), "Usage: /runpod-remove <model-id>")
 })
 
 test("errors from the operations port are reported as text, never thrown", async () => {
   const { h, defs } = host()
   const replies: string[] = []
-  await registerCommands(h, ops({ up: async () => { throw new Error("RunPod: declined") }, down: async () => [] }), async (_s, text) => { replies.push(text) })
-  await defs.get("runpod-up")!.execute({ sessionID: "s", prompt: { text: "m" } })
+  await registerCommands(h, ops({ up: async () => { throw new Error("RunPod: declined") }, down: async () => [], add: async () => { throw new Error("RunPod: already exists") } }), async (_s, text) => { replies.push(text) })
+  await run(defs, "runpod-up", "m")
   assert.equal(replies.at(-1), "RunPod: declined")
-  await defs.get("runpod-down")!.execute({ sessionID: "s", prompt: { text: "" } })
+  await run(defs, "runpod-down", "")
   assert.equal(replies.at(-1), "No RunPod endpoints to delete")
+  await run(defs, "runpod-add", "org/repo")
+  assert.equal(replies.at(-1), "RunPod: already exists")
 })
 ```
 
@@ -4259,7 +5319,7 @@ Expected: FAIL — modules not found.
 
 ```ts
 import type { Model, Provider } from "@opencode/plugin"
-import type { ModelConfig } from "../../../core/domain/model.ts"
+import type { PublishedModel } from "../../../core/ports/catalog-publisher.ts"
 
 export const PROVIDER_ID = "runpod"
 export const PROVIDER_NAME = "RunPod Serverless"
@@ -4284,14 +5344,16 @@ export function buildProviderInfo(apiKey: string | null): Provider.Info {
   }
 }
 
-export function buildModelInfo(model: ModelConfig): Model.Info {
+/** GPU pools appear as selectable variants; the model.request hook receives the chosen pool as `model.variant`. */
+export function buildModelInfo(published: PublishedModel): Model.Info {
+  const model = published.config
   return {
     id: model.id as Model.ID,
     providerID: PROVIDER_ID as Provider.ID,
     modelID: model.id as Model.ID,
     name: model.name,
     capabilities: { tools: model.tools, input: ["text"], output: ["text"] },
-    variants: [],
+    variants: published.variants.map((pool) => ({ id: pool as Model.VariantID })),
     time: { released: Date.UTC(2026, 0, 1) },
     cost: [],
     status: "active",
@@ -4301,13 +5363,14 @@ export function buildModelInfo(model: ModelConfig): Model.Info {
 }
 ```
 
-If `tsc` reports that `Provider.Info` or `Model.Info` requires a field not listed, add exactly that field with its neutral value (`[]`, `{}`, `undefined` as the error allows) — never cast the whole object. If `Provider.ID`/`Model.ID` are not exported as types from `@opencode/plugin`, import them from `@opencode/schema/provider` / `@opencode/schema/model`.
+If `tsc` reports that `Provider.Info`, `Model.Info` or a variant requires a field not listed, add exactly that field with its neutral value (`[]`, `{}`, `undefined` as the error allows) — never cast the whole object. If `Provider.ID`, `Model.ID` or `Model.VariantID` are not exported as types from `@opencode/plugin`, import them from `@opencode/schema/provider` / `@opencode/schema/model`.
 
 - [ ] **Step 4: Implement `src/adapters/driving/opencode/commands.ts`**
 
 ```ts
 import type { OperationsPort } from "../../../core/ports/driving.ts"
-import { formatStatus } from "../rpc/format.ts"
+import { formatModel, formatStatus } from "../rpc/format.ts"
+import { OVERRIDE_KEYS, parseOverrides } from "./config.ts"
 
 export interface CommandInvocationLike {
   sessionID: string
@@ -4328,51 +5391,82 @@ export interface CommandHost {
 
 export type Reply = (sessionID: string, text: string) => Promise<void>
 
-/** First argument after the slash command token, or null. */
-export function parseArg(text: string): string | null {
-  const rest = text.trim().replace(/^\/\S+\s*/, "")
-  const first = rest.split(/\s+/)[0]
-  return first ? first : null
+/** Whitespace-separated arguments after the slash command token. */
+export function parseArgs(text: string): string[] {
+  return text.trim().replace(/^\/\S+\s*/, "").split(/\s+/).filter((s) => s.length > 0)
 }
 
+const SET_USAGE = `Usage: /runpod-set <model-id> key=value [key=value …] (keys: ${OVERRIDE_KEYS.join(", ")})`
+
 export async function registerCommands(host: CommandHost, ops: OperationsPort, reply: Reply): Promise<void> {
+  const guarded = (sessionID: string, action: () => Promise<string>) =>
+    action().then(
+      (text) => reply(sessionID, text),
+      (error: unknown) => reply(sessionID, (error as Error).message),
+    )
+
   await host.command.transform((editor) => {
     editor.add({
       name: "runpod-status",
       description: "RunPod endpoints: phase, GPU, $/h and session spend",
-      execute: async ({ sessionID }) => {
-        await reply(sessionID, formatStatus(await ops.status()))
-      },
+      execute: ({ sessionID }) => guarded(sessionID, async () => formatStatus(await ops.status())),
     })
     editor.add({
       name: "runpod-up",
       description: "Provision and warm a RunPod model without the confirm dialog: /runpod-up <model-id>",
-      execute: async ({ sessionID, prompt }) => {
-        const modelID = parseArg(prompt.text)
-        if (!modelID) {
-          await reply(sessionID, "Usage: /runpod-up <model-id>")
-          return
-        }
-        try {
-          const baseURL = await ops.up(modelID)
-          await reply(sessionID, `RunPod ${modelID} is warm at ${baseURL}`)
-        } catch (error) {
-          await reply(sessionID, (error as Error).message)
-        }
-      },
+      execute: ({ sessionID, prompt }) =>
+        guarded(sessionID, async () => {
+          const [modelID] = parseArgs(prompt.text)
+          if (!modelID) return "Usage: /runpod-up <model-id>"
+          return `RunPod ${modelID} is warm at ${await ops.up(modelID)}`
+        }),
     })
     editor.add({
       name: "runpod-down",
       description: "Delete RunPod endpoint(s) and stop billing: /runpod-down [model-id|all]",
-      execute: async ({ sessionID, prompt }) => {
-        const arg = parseArg(prompt.text)
-        try {
+      execute: ({ sessionID, prompt }) =>
+        guarded(sessionID, async () => {
+          const [arg] = parseArgs(prompt.text)
           const deleted = await ops.down(arg && arg !== "all" ? arg : undefined)
-          await reply(sessionID, deleted.length > 0 ? `Deleted RunPod endpoint(s): ${deleted.join(", ")}` : "No RunPod endpoints to delete")
-        } catch (error) {
-          await reply(sessionID, (error as Error).message)
-        }
-      },
+          return deleted.length > 0 ? `Deleted RunPod endpoint(s): ${deleted.join(", ")}` : "No RunPod endpoints to delete"
+        }),
+    })
+    editor.add({
+      name: "runpod-add",
+      description: "Add a model at runtime: /runpod-add <org/repo> [gpu-pool] [key=value …]",
+      execute: ({ sessionID, prompt }) =>
+        guarded(sessionID, async () => {
+          const [hf, ...rest] = parseArgs(prompt.text)
+          if (!hf) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
+          const gpu = rest[0] !== undefined && !rest[0].includes("=") ? rest.shift() : undefined
+          const overrides = parseOverrides([...(hf.includes("=") ? [hf] : []), ...rest])
+          if (hf.includes("=")) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
+          if (!/^[\w.-]+\/[\w.-]+$/.test(hf)) return `hf: expected a Hugging Face repo id like org/name, got "${hf}"`
+          const added = await ops.add({ hf, ...(gpu === undefined ? {} : { gpu }), overrides })
+          return `Added runpod/${added.id} · ${formatModel(added)}\nSelect it in /models; the first request shows the provision dialog.`
+        }),
+    })
+    editor.add({
+      name: "runpod-set",
+      description: "Change a model's runtime configuration: /runpod-set <model-id> key=value …",
+      execute: ({ sessionID, prompt }) =>
+        guarded(sessionID, async () => {
+          const [modelID, ...pairs] = parseArgs(prompt.text)
+          if (!modelID || pairs.length === 0) return SET_USAGE
+          const updated = await ops.set(modelID, parseOverrides(pairs))
+          return `Updated ${formatModel(updated)}`
+        }),
+    })
+    editor.add({
+      name: "runpod-remove",
+      description: "Remove a runtime model (and its endpoint) or reset a configured model's overrides: /runpod-remove <model-id>",
+      execute: ({ sessionID, prompt }) =>
+        guarded(sessionID, async () => {
+          const [modelID] = parseArgs(prompt.text)
+          if (!modelID) return "Usage: /runpod-remove <model-id>"
+          const result = await ops.remove(modelID)
+          return result === "removed" ? `Removed runpod/${modelID}` : `Reset runpod/${modelID} to its opencode.json configuration`
+        }),
     })
   })
 }
@@ -4381,13 +5475,13 @@ export async function registerCommands(host: CommandHost, ops: OperationsPort, r
 - [ ] **Step 5: Run tests and typecheck**
 
 Run: `npm run check`
-Expected: pass.
+Expected: pass. Note the `/runpod-add` test expects the call `add:{"hf":"Qwen/Qwen3-8B","overrides":{"context":4096}}` when no pool is given (no `gpu` key at all) — the spread `...(gpu === undefined ? {} : { gpu })` produces exactly that.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/adapters/driving/opencode/provider-catalog.ts src/adapters/driving/opencode/commands.ts test/provider-catalog.test.ts test/commands.test.ts
-git commit -m "feat(opencode): provider/model catalog builders and /runpod-* commands"
+git commit -m "feat(opencode): provider catalog with GPU variants and /runpod-* commands incl. add/set/remove"
 ```
 
 ---
@@ -4398,7 +5492,7 @@ git commit -m "feat(opencode): provider/model catalog builders and /runpod-* com
 - Modify: `src/adapters/driving/opencode/plugin.ts` (replace the stub)
 
 **Interfaces:**
-- Consumes: everything. Wires `EndpointService` to the adapters, registers the provider, the `model.request` hook, the RPC methods and the commands, and returns the cleanup function.
+- Consumes: everything. Wires `EndpointService` to the adapters, registers the provider (reading the publisher's current list, so runtime changes appear after `provider.reload()`), the `model.request` hook (variant → `gpu`), the RPC methods and the commands, and returns the cleanup function.
 
 - [ ] **Step 1: Replace `src/adapters/driving/opencode/plugin.ts`**
 
@@ -4407,6 +5501,7 @@ import { Plugin } from "@opencode/plugin"
 import type { RpcRegistration } from "@opencode/plugin/promise/rpc"
 import { EndpointService } from "../../../core/application/endpoint-service.ts"
 import { HfWeightsInfo } from "../../driven/huggingface/weights-info.ts"
+import { OpencodeCatalogPublisher } from "../../driven/opencode/catalog-publisher.ts"
 import { ConfirmBroker, RpcConfirmation } from "../../driven/opencode/confirmation.ts"
 import { RpcNotifier } from "../../driven/opencode/notifier.ts"
 import { OpencodeStateStore } from "../../driven/opencode/state-store.ts"
@@ -4437,6 +5532,7 @@ export default Plugin.define({
     const compute = http ? new RunpodComputeProvider(http) : null
     const catalog = new RunpodPriceCatalog(http, clock)
     const broker = new ConfirmBroker(settings.confirmTimeoutSec * 1000)
+    const publisher = new OpencodeCatalogPublisher(() => ctx.provider.reload())
 
     let registration: RpcRegistration<typeof RunpodRpc> | undefined
     const fire = (promise: Promise<void> | undefined) => {
@@ -4450,11 +5546,12 @@ export default Plugin.define({
       recipe: new VllmWorkerRecipe(secrets.hfToken),
       store: new OpencodeStateStore(ctx.storage),
       clock,
-      confirmation: new RpcConfirmation(broker, (requestID, quote) => fire(registration?.events.emit("confirm.requested", { requestID, quote }))),
+      confirmation: new RpcConfirmation(broker, (requestID, proposal) => fire(registration?.events.emit("confirm.requested", { requestID, proposal }))),
       notifier: new RpcNotifier({
         state: (event) => fire(registration?.events.emit("state", event)),
         notice: (level, message) => fire(registration?.events.emit("notice", { level, message })),
       }),
+      publisher,
       logger,
     })
 
@@ -4462,25 +5559,30 @@ export default Plugin.define({
       status: async () => service.status(),
       up: async ({ modelID }) => ({ baseURL: await service.up(modelID) }),
       down: async ({ modelID }) => ({ deleted: await service.down(modelID) }),
-      confirm: async ({ requestID, accepted }) => ({ ok: broker.resolve(requestID, accepted) }),
+      confirm: async ({ requestID, accepted, overrides }) => ({
+        ok: broker.resolve(requestID, accepted ? { accepted: true, overrides: overrides ?? {} } : { accepted: false }),
+      }),
     })
 
-    const reply = async (sessionID: string, text: string) => {
-      fire(registration?.events.emit("notice", { level: "info", message: text }))
-      await ctx.session.synthetic({ sessionID, text })
-    }
-
+    // Static models are visible immediately; start() republishes with variants and runtime additions.
+    publisher.seed(settings.models.map((config) => ({ config, variants: [] })))
     await ctx.provider.transform((editor) => {
-      editor.add({ info: buildProviderInfo(secrets.apiKey), models: settings.models.map(buildModelInfo) })
+      editor.add({ info: buildProviderInfo(secrets.apiKey), models: publisher.current.map(buildModelInfo) })
     })
 
     await ctx.session.hook(
       "model.request",
       async (event) => {
-        event.baseURL = await service.ensureReady(event.model.id)
+        const variant = event.model.variant
+        event.baseURL = await service.ensureReady(event.model.id, variant === undefined ? {} : { gpu: variant })
       },
       { providerID: PROVIDER_ID },
     )
+
+    const reply = async (sessionID: string, text: string) => {
+      fire(registration?.events.emit("notice", { level: "info", message: text }))
+      await ctx.session.synthetic({ sessionID, text })
+    }
 
     await registerCommands(
       {
@@ -4502,7 +5604,7 @@ export default Plugin.define({
       reply,
     )
 
-    service.start().catch((error: unknown) => logger.warn("startup reconcile failed", { error: String(error) }))
+    service.start().catch((error: unknown) => logger.warn("startup failed", { error: String(error) }))
 
     return async () => {
       await service.stop(10_000)
@@ -4515,25 +5617,25 @@ export default Plugin.define({
 - [ ] **Step 2: Typecheck and unit tests**
 
 Run: `npm run check`
-Expected: pass. Typical fixes if tsc complains: (a) `ctx.storage` → wrap as `{ get: (k) => ctx.storage.get(k), set: (k, v) => ctx.storage.set(k, v as never), remove: (k) => ctx.storage.remove(k) }`; (b) `RpcRegistration` not exported at that path → `import type { RpcRegistration } from "@opencode/plugin/promise/rpc"` is the documented subpath (`./*` export); if missing, declare `let registration: Awaited<ReturnType<typeof ctx.rpc.register<typeof RunpodRpc>>> | undefined`.
+Expected: pass. Typical fixes if tsc complains: (a) `ctx.storage` → wrap as `{ get: (k) => ctx.storage.get(k), set: (k, v) => ctx.storage.set(k, v as never), remove: (k) => ctx.storage.remove(k), scan: (o) => ctx.storage.scan(o) }`; (b) `RpcRegistration` not exported at that path → `import type { RpcRegistration } from "@opencode/plugin/promise/rpc"` is the documented `./*` subpath; if missing, declare `let registration: Awaited<ReturnType<typeof ctx.rpc.register<typeof RunpodRpc>>> | undefined`; (c) `event.model.variant` is a branded string — passing it as `gpu: string` is fine.
 
 - [ ] **Step 3: Verify the plugin loads and registers the provider**
 
 Run (repo root so `.opencode/opencode.jsonc` applies):
 ```bash
-cd /Volumes/dev/projects/runpod-opencode && opencode service restart >/dev/null 2>&1; opencode models 2>&1 | grep -i runpod
+cd /Volumes/dev/projects/runpod-opencode/.claude/worktrees/feat-runpod-plugin && opencode service restart >/dev/null 2>&1; opencode models 2>&1 | grep -i runpod
 ```
-Expected: `runpod/qwen3-0.6b`. If empty: `opencode --print-logs models 2>&1 | grep -iE "runpod|plugin"` and fix the reported load error (missing `node_modules`, non-erasable syntax, schema field).
+Expected: `runpod/qwen3-0.6b` (variants, if the listing shows them, are the pool ids ≥ 16 GB: AMPERE_16, AMPERE_24, ADA_24, …). If nothing prints: `opencode --print-logs models 2>&1 | grep -iE "runpod|plugin"` and fix the reported load error (missing `node_modules`, non-erasable syntax, schema field).
 
 - [ ] **Step 4: Verify the hook path without an API key**
 
-In the repo directory run `opencode`, pick `runpod/qwen3-0.6b` via `/models`, send `hi`.
+In the worktree directory run `opencode`, pick `runpod/qwen3-0.6b` via `/models`, send `hi`.
 Expected: the request fails with `RunPod: no API key configured — set options.apiKey or the RUNPOD_API_KEY environment variable.` (proves the `model.request` hook reaches `EndpointService`). No RunPod call is made.
 
-- [ ] **Step 5: Verify the `/runpod-status` reply channel (spec §9.1)**
+- [ ] **Step 5: Verify the `/runpod-status` reply channel (spec §9.1) and runtime commands**
 
-Still in the TUI, switch back to a homelab model and run `/runpod-status`.
-- If the text appears and the model does **not** start generating: keep `reply` as written.
+Still in the TUI, switch to a homelab model and run `/runpod-status`, then `/runpod-add Qwen/Qwen3-8B AMPERE_16 context=8192`, then `/models` (the new model must appear without restarting), then `/runpod-remove qwen3-8b`.
+- If the reply text appears and the model does **not** start generating: keep `reply` as written.
 - If the model starts a turn from the synthetic message: change `reply` to toast-only —
   ```ts
   const reply = async (_sessionID: string, text: string) => {
@@ -4546,23 +5648,90 @@ Still in the TUI, switch back to a homelab model and run `/runpod-status`.
 
 ```bash
 git add src/adapters/driving/opencode/plugin.ts
-git commit -m "feat(opencode): composition root wiring EndpointService, provider, hook, RPC and commands"
+git commit -m "feat(opencode): composition root wiring EndpointService, provider catalog, hook, RPC and commands"
 ```
 
 ---
 
-### Task 15: TUI adapter — confirm dialog, toasts, footer status
+### Task 15: TUI adapter — provision dialog loop, toasts, footer status
 
 **Files:**
-- Create: `src/adapters/driving/tui/toasts.ts`
+- Create: `src/adapters/driving/tui/choose.ts`, `src/adapters/driving/tui/toasts.ts`
 - Modify: `src/adapters/driving/tui/plugin.tsx` (replace the stub)
-- Test: `test/toasts.test.ts`
+- Test: `test/choose.test.ts`, `test/toasts.test.ts`
 
 **Interfaces:**
-- Consumes: `RunpodRpc`, `formatQuote`, `footerLabel`, `formatDuration`, `formatUsd`, `StateEvent`, `ModelStatus`.
-- Produces: `interface ToastDecision { message: string; variant: "info" | "success" | "warning" | "error" }`, `toastFor(prev: StateEvent | undefined, next: StateEvent): ToastDecision | null`.
+- Consumes: `RunpodRpc`, `formatQuote`, `formatGpuOption`, `formatIdleChoice`, `footerLabel`, `formatDuration`, `formatUsd`, `idleWindowUsd`, `StateEvent`, `ModelStatus`, `ProvisionProposal`, `ProvisionDecision`.
+- Produces: `interface SelectOption<V> { title; value; description? }`, `interface DialogLike { select<V>(options: { title; placeholder?; current?: V; options: readonly SelectOption<V>[] }): Promise<V | undefined> }`, `chooseProvision(dialog: DialogLike, proposal: ProvisionProposal): Promise<ProvisionDecision>`; `interface ToastDecision { message; variant }`, `toastFor(prev: StateEvent | undefined, next: StateEvent): ToastDecision | null`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+`test/choose.test.ts`:
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { chooseProvision, type DialogLike } from "../src/adapters/driving/tui/choose.ts"
+import type { ProvisionProposal } from "../src/core/domain/provision.ts"
+
+const proposal: ProvisionProposal = {
+  quote: { modelID: "m", hf: "a/b", gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB", gpuCount: 1, ratePerHour: 1.22, rateSource: "catalog", weightsGb: 31.6, estColdStartSec: 156, idleTimeout: 120, idleWindowUsd: 0.0407, warnings: [], blocked: null },
+  gpuOptions: [
+    { pool: "AMPERE_16", label: "A4000/A4500 16GB", ratePerHour: 0.58, rateSource: "catalog", vramGb: 16, fits: false, estColdStartSec: 156, current: false },
+    { pool: "AMPERE_48", label: "A6000/A40 48GB", ratePerHour: 1.22, rateSource: "catalog", vramGb: 48, fits: true, estColdStartSec: 156, current: true },
+    { pool: "AMPERE_80", label: "A100 80GB", ratePerHour: 2.72, rateSource: "catalog", vramGb: 80, fits: true, estColdStartSec: 156, current: false },
+  ],
+  idleTimeoutChoices: [30, 60, 120, 300],
+}
+
+/** Answers each select() call in order; records what was shown. */
+function scripted(answers: unknown[]) {
+  const shown: { title: string; current: unknown; options: { title: string; value: unknown; description?: string }[] }[] = []
+  const dialog: DialogLike = {
+    select: async (options) => {
+      shown.push({ title: options.title, current: options.current, options: options.options.map((o) => ({ title: o.title, value: o.value, description: o.description })) })
+      if (answers.length === 0) throw new Error("no scripted answer")
+      return answers.shift() as never
+    },
+  }
+  return { dialog, shown }
+}
+
+test("provisioning as proposed yields an accepted decision without overrides", async () => {
+  const { dialog, shown } = scripted(["go"])
+  assert.deepEqual(await chooseProvision(dialog, proposal), { accepted: true, overrides: {} })
+  assert.equal(shown.length, 1)
+  assert.equal(shown[0]!.title, "RunPod: provision m?")
+  assert.equal(shown[0]!.options[0]!.title, "Provision on A6000/A40 48GB — $1.22/h")
+  assert.match(shown[0]!.options[0]!.description ?? "", /Cold start ≈ 2m 36s/)
+  assert.equal(shown[0]!.options[1]!.title, "Change GPU…")
+  assert.equal(shown[0]!.options[2]!.title, "Change idle timeout (120s)…")
+  assert.equal(shown[0]!.options[3]!.title, "Cancel")
+})
+
+test("changing GPU and idle timeout re-prices the main option and returns both overrides", async () => {
+  const { dialog, shown } = scripted(["gpu", "AMPERE_80", "idle", 60, "go"])
+  assert.deepEqual(await chooseProvision(dialog, proposal), { accepted: true, overrides: { gpu: "AMPERE_80", idleTimeout: 60 } })
+  assert.equal(shown[1]!.title, "GPU pool")
+  assert.equal(shown[1]!.current, "AMPERE_48")
+  assert.deepEqual(shown[1]!.options.map((o) => o.value), ["AMPERE_16", "AMPERE_48", "AMPERE_80"])
+  assert.match(shown[1]!.options[0]!.title, /too small/)
+  assert.equal(shown[2]!.options[0]!.title, "Provision on A100 80GB — $2.72/h")
+  assert.equal(shown[3]!.current, 120)
+  assert.deepEqual(shown[3]!.options.map((o) => o.value), [30, 60, 120, 300])
+  assert.match(shown[3]!.options[1]!.title, /^1m 0s ≈ \$0\.05 per idle window$/)
+  assert.equal(shown[4]!.options[2]!.title, "Change idle timeout (60s)…")
+})
+
+test("choosing the original values again yields no overrides; dismissing a sub-select keeps the previous value", async () => {
+  const { dialog } = scripted(["gpu", "AMPERE_48", "idle", undefined, "go"])
+  assert.deepEqual(await chooseProvision(dialog, proposal), { accepted: true, overrides: {} })
+})
+
+test("cancel or dismissing the main select declines", async () => {
+  assert.deepEqual(await chooseProvision(scripted(["cancel"]).dialog, proposal), { accepted: false })
+  assert.deepEqual(await chooseProvision(scripted([undefined]).dialog, proposal), { accepted: false })
+})
+```
 
 `test/toasts.test.ts`:
 ```ts
@@ -4575,7 +5744,7 @@ const base: StateEvent = { modelID: "m", phase: "cold", detail: null, elapsedSec
 const at = (phase: StateEvent["phase"], extra: Partial<StateEvent> = {}): StateEvent => ({ ...base, phase, ...extra })
 
 test("phase transitions produce the expected toasts", () => {
-  assert.equal(toastFor(undefined, at("confirming"))?.message, undefined)
+  assert.equal(toastFor(undefined, at("confirming")), null)
   assert.deepEqual(toastFor(at("confirming"), at("creating")), { message: "Provisioning m on A6000/A40 48GB · $1.22/h", variant: "info" })
   assert.deepEqual(toastFor(at("creating"), at("warming", { elapsedSec: 0 })), { message: "Cold start of m…", variant: "info" })
   assert.deepEqual(toastFor(at("warming"), at("ready", { elapsedSec: 142, spendUsd: 0.05 })), { message: "m ready in 2m 22s · ≈$0.05", variant: "success" })
@@ -4601,12 +5770,81 @@ test("warming progress toasts every 30 seconds only", () => {
 })
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `npm test`
-Expected: FAIL — cannot find `toasts.ts`.
+Expected: FAIL — cannot find `choose.ts` / `toasts.ts`.
 
-- [ ] **Step 3: Implement `src/adapters/driving/tui/toasts.ts`**
+- [ ] **Step 3: Implement `src/adapters/driving/tui/choose.ts`**
+
+```ts
+import type { ProvisionDecision, ProvisionOverrides, ProvisionProposal } from "../../../core/domain/provision.ts"
+import { idleWindowUsd } from "../../../core/domain/quote.ts"
+import { formatGpuOption, formatIdleChoice, formatQuote, formatUsd } from "../rpc/format.ts"
+
+export interface SelectOption<V> {
+  title: string
+  value: V
+  description?: string
+}
+
+/** The subset of `context.ui.dialog` the provisioning flow needs (so it can be tested with a scripted dialog). */
+export interface DialogLike {
+  select<V>(options: { title: string; placeholder?: string; current?: V; options: readonly SelectOption<V>[] }): Promise<V | undefined>
+}
+
+type Action = "go" | "gpu" | "idle" | "cancel"
+
+/** Select-driven provisioning dialog: provision as proposed, change the GPU pool, change the idle timeout, or cancel. */
+export async function chooseProvision(dialog: DialogLike, proposal: ProvisionProposal): Promise<ProvisionDecision> {
+  const quote = proposal.quote
+  let gpu = quote.gpu
+  let idleTimeout = quote.idleTimeout
+  for (;;) {
+    const option = proposal.gpuOptions.find((o) => o.pool === gpu)
+    const label = option?.label ?? quote.gpuLabel
+    const rate = option?.ratePerHour ?? quote.ratePerHour
+    const warnings = gpu === quote.gpu ? quote.warnings : option?.fits === false ? [`weights ≈${quote.weightsGb} GB may not fit ${label}`] : []
+    const action = await dialog.select<Action>({
+      title: `RunPod: provision ${quote.modelID}?`,
+      options: [
+        {
+          title: `Provision on ${label} — ${formatUsd(rate)}/h`,
+          value: "go",
+          description: formatQuote({ ...quote, gpu, gpuLabel: label, ratePerHour: rate, rateSource: option?.rateSource ?? quote.rateSource, idleTimeout, idleWindowUsd: idleWindowUsd(rate, idleTimeout), warnings }),
+        },
+        { title: "Change GPU…", value: "gpu", description: `${proposal.gpuOptions.length} pools available` },
+        { title: `Change idle timeout (${idleTimeout}s)…`, value: "idle", description: formatIdleChoice(idleTimeout, rate) },
+        { title: "Cancel", value: "cancel" },
+      ],
+    })
+    if (action === undefined || action === "cancel") return { accepted: false }
+    if (action === "go") {
+      const overrides: ProvisionOverrides = {}
+      if (gpu !== quote.gpu) overrides.gpu = gpu
+      if (idleTimeout !== quote.idleTimeout) overrides.idleTimeout = idleTimeout
+      return { accepted: true, overrides }
+    }
+    if (action === "gpu") {
+      const picked = await dialog.select<string>({
+        title: "GPU pool",
+        current: gpu,
+        options: proposal.gpuOptions.map((o) => ({ title: formatGpuOption(o), value: o.pool })),
+      })
+      if (picked !== undefined) gpu = picked
+      continue
+    }
+    const pickedIdle = await dialog.select<number>({
+      title: "Idle timeout (the worker stays warm and billed this long after each request)",
+      current: idleTimeout,
+      options: proposal.idleTimeoutChoices.map((seconds) => ({ title: formatIdleChoice(seconds, rate), value: seconds })),
+    })
+    if (pickedIdle !== undefined) idleTimeout = pickedIdle
+  }
+}
+```
+
+- [ ] **Step 4: Implement `src/adapters/driving/tui/toasts.ts`**
 
 ```ts
 import type { StateEvent } from "../../../core/domain/events.ts"
@@ -4653,19 +5891,20 @@ export function toastFor(prev: StateEvent | undefined, next: StateEvent): ToastD
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 5: Run tests**
 
 Run: `npm test`
-Expected: toast tests pass.
+Expected: choose and toast tests pass.
 
-- [ ] **Step 5: Replace `src/adapters/driving/tui/plugin.tsx`**
+- [ ] **Step 6: Replace `src/adapters/driving/tui/plugin.tsx`**
 
 ```tsx
 import { Plugin } from "@opencode/plugin/tui"
 import { Show } from "solid-js"
 import type { ModelStatus, StateEvent } from "../../../core/domain/events.ts"
 import { RunpodRpc } from "../rpc/contract.ts"
-import { footerLabel, formatQuote } from "../rpc/format.ts"
+import { footerLabel } from "../rpc/format.ts"
+import { chooseProvision } from "./choose.ts"
 import { toastFor } from "./toasts.ts"
 
 interface TuiState {
@@ -4677,7 +5916,7 @@ function fromStatus(m: ModelStatus): StateEvent {
   return { modelID: m.modelID, phase: m.phase, detail: m.detail, elapsedSec: null, spendUsd: m.spendUsd, ratePerHour: m.ratePerHour, gpu: m.gpu, gpuLabel: m.gpuLabel }
 }
 
-/** UI adapter: confirm dialog, toasts and a footer status line, all fed by the server plugin's RPC events. */
+/** UI adapter: provisioning dialog, toasts and a footer status line, all fed by the server plugin's RPC events. */
 export default Plugin.define({
   id: "runpod.tui",
   async setup(context) {
@@ -4685,13 +5924,9 @@ export default Plugin.define({
     const [state, update] = context.storage.memory<TuiState>("runpod", { initial: { active: null, last: {} } })
 
     const offConfirm = rpc.events.on("confirm.requested", async (event) => {
-      const { requestID, quote } = event.data
-      const accepted = await context.ui.dialog.confirm({
-        title: `RunPod: provision ${quote.modelID}?`,
-        message: formatQuote(quote),
-        label: { confirm: "Provision", cancel: "Cancel" },
-      })
-      await rpc.confirm({ requestID, accepted: accepted === true })
+      const { requestID, proposal } = event.data
+      const decision = await chooseProvision(context.ui.dialog, proposal)
+      await rpc.confirm(decision.accepted ? { requestID, accepted: true, overrides: decision.overrides } : { requestID, accepted: false })
     })
 
     const offState = rpc.events.on("state", (event) => {
@@ -4740,32 +5975,34 @@ export default Plugin.define({
 })
 ```
 
-If `context.theme.text.muted` does not exist in `ResolvedTheme`, use `context.theme.text.base` (the token the docs show).
+If `context.theme.text.muted` does not exist in `ResolvedTheme`, use `context.theme.text.base` (the token the docs show). `context.ui.dialog` satisfies `DialogLike` structurally (`select<V>(options)` → `Promise<V | undefined>`); if tsc disagrees on the option shape, pass `{ select: (o) => context.ui.dialog.select(o) }` instead.
 
-- [ ] **Step 6: Typecheck**
+- [ ] **Step 7: Typecheck**
 
 Run: `npm run check`
-Expected: pass (JSX is typechecked against `@opentui/solid`; runtime transform is done by the opencode TUI host).
+Expected: pass (JSX is typechecked against `@opentui/solid`; the runtime transform is done by the opencode TUI host).
 
-- [ ] **Step 7: Manual end-to-end in the TUI (real RunPod account, ≈$0.05)**
+- [ ] **Step 8: Manual end-to-end in the TUI (real RunPod account, ≈$0.05)**
 
 ```bash
-cd /Volumes/dev/projects/runpod-opencode && export RUNPOD_API_KEY=<your key> && opencode service restart >/dev/null 2>&1; opencode
+cd /Volumes/dev/projects/runpod-opencode/.claude/worktrees/feat-runpod-plugin && export RUNPOD_API_KEY=<your key> && opencode service restart >/dev/null 2>&1; opencode
 ```
 1. `/models` → pick `runpod/qwen3-0.6b`; send `Reply with one word.`
-2. Expected: confirm dialog "RunPod: provision qwen3-0.6b?" with the quote (A4000/A4500 16GB, $0.58/h, cold start estimate). Choose **Provision**.
+2. Expected: select dialog "RunPod: provision qwen3-0.6b?" with *Provision on A4000/A4500 16GB — $0.58/h* (description = quote), *Change GPU…*, *Change idle timeout (60s)…*, *Cancel*. Open *Change GPU…* (every pool priced, fits flags), go back, choose *Provision*.
 3. Expected toasts: "Provisioning qwen3-0.6b on A4000/A4500 16GB · $0.58/h", "Cold start of qwen3-0.6b…", progress every 30 s, then "qwen3-0.6b ready in …"; the answer streams in; footer shows `runpod A4000/A4500 16GB · warm · $0.58/h · ≈$0.0x`.
 4. `/runpod-status` → one line with `[<endpointID>]`, session ≈$, and (after a minute) billed $.
-5. Wait ~75 s without sending anything → toast "qwen3-0.6b scaled to zero · ≈$… this session", footer says `cold`.
+5. Wait ~75 s idle → toast "qwen3-0.6b scaled to zero · ≈$… this session", footer says `cold`.
 6. Send another message → "Cold start of qwen3-0.6b…" without a dialog → answer.
-7. `/runpod-down qwen3-0.6b` → reply "Deleted RunPod endpoint(s): qwen3-0.6b"; confirm in the RunPod console that no `oc-runpod-*` endpoint remains.
-8. Provision once more, then quit opencode and run `opencode service stop`. Check the RunPod console: the endpoint must be gone (cleanup on plugin dispose). Note whether quitting only the TUI (background service still running) already removed it; record the observed behaviour in the README caveat in Task 16.
+7. In `/models` pick the same model with a different variant (e.g. `AMPERE_24`) and send a message → expected: a notice that the configuration changed and the endpoint is deleted, then the provision dialog for the new pool with its price.
+8. `/runpod-set qwen3-0.6b idleTimeout=30` → reply shows `idleTimeout=30`; `/runpod-status` unchanged endpoint id (patched, not recreated).
+9. `/runpod-down qwen3-0.6b` → reply "Deleted RunPod endpoint(s): qwen3-0.6b"; confirm in the RunPod console that no `oc-runpod-*` endpoint remains.
+10. Provision once more, quit the TUI, run `opencode service stop`, then start opencode again in the same directory and run `/runpod-status`: with the default `deleteOnExit: false` the endpoint must still exist and be reported as `idle` (re-adopted). Then set `"deleteOnExit": true` in `.opencode/opencode.jsonc`, restart the service, provision, `opencode service stop`, and verify in the console that the endpoint is gone. Restore the dev config afterwards.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src/adapters/driving/tui test/toasts.test.ts
-git commit -m "feat(tui): confirm dialog, state toasts and footer status over RPC"
+git add src/adapters/driving/tui test/choose.test.ts test/toasts.test.ts
+git commit -m "feat(tui): provisioning dialog with GPU/idle choices, state toasts and footer status"
 ```
 
 ---
@@ -4821,18 +6058,21 @@ const service = new EndpointService(settings, {
     remove: async (key) => {
       store.delete(key)
     },
+    keys: async (prefix) => [...store.keys()].filter((k) => k.startsWith(prefix)).sort(),
   },
   clock,
-  confirmation: { ask: async () => true },
+  confirmation: { ask: async () => ({ accepted: true, overrides: {} }) },
   notifier: {
     state: (e) => console.log(`[${e.phase}] ${e.detail ?? ""} ≈$${e.spendUsd.toFixed(3)}`),
     notice: (level, message) => console.log(level, message),
   },
+  publisher: { publish: async (models) => console.log("catalog:", models.map((m) => `${m.config.id} [${m.variants.join(", ")}]`).join("; ")) },
   logger: new ConsoleLogger("[smoke]"),
 })
 
 const started = Date.now()
 try {
+  await service.start()
   const baseURL = await service.ensureReady("smoke-qwen3-0.6b")
   const response = await fetch(`${baseURL}/chat/completions`, {
     method: "POST",
@@ -4846,7 +6086,7 @@ try {
   console.log("elapsed s", Math.round((Date.now() - started) / 1000))
 }
 ```
-Run: `RUNPOD_API_KEY=… npm run smoke`. Expected: phases `creating → warming (progress) → ready`, `chat 200 …`, `deleted [ "smoke-qwen3-0.6b" ]`, session spend well under $0.10. Fix any RunPod payload mismatch discovered here (list envelope key, billing shape) in `http.ts` with a matching unit test.
+Run: `RUNPOD_API_KEY=… npm run smoke`. Expected: `catalog: smoke-qwen3-0.6b [AMPERE_16, AMPERE_24, …]`, phases `creating → warming (progress) → ready`, `chat 200 …`, `deleted [ "smoke-qwen3-0.6b" ]`, session spend well under $0.10. Fix any RunPod payload mismatch discovered here (list envelope key, billing shape) in `http.ts` with a matching unit test.
 
 - [ ] **Step 2: Create `examples/opencode.jsonc`**
 
@@ -4862,6 +6102,7 @@ Run: `RUNPOD_API_KEY=… npm run smoke`. Expected: phases `creating → warming 
         "idleTimeout": 120,
         "workersMax": 1,
         "maxHourlyRate": 3,
+        "deleteOnExit": false, // default: idle endpoints cost $0 and are re-used next session; /runpod-down deletes explicitly
         "dataCenterIds": ["EU-RO-1", "EU-SE-1", "EU-CZ-1", "EU-NL-1"],
         "models": {
           "qwen3-coder-30b-a3b": {
@@ -4877,7 +6118,8 @@ Run: `RUNPOD_API_KEY=… npm run smoke`. Expected: phases `creating → warming 
             "hf": "huihui-ai/REPLACE-WITH-THE-SAFETENSORS-REPO", // GGUF-only repos do not run on vLLM
             "gpu": "AMPERE_80",
             "context": 98304,
-            "output": 16384
+            "output": 16384,
+            "idleTimeout": 300
           },
           "glm-4.7-flash-abliterated": {
             "name": "GLM 4.7 Flash Abliterated (RunPod)",
@@ -4914,17 +6156,35 @@ Run: `RUNPOD_API_KEY=… npm run smoke`. Expected: phases `creating → warming 
 # opencode-runpod
 
 opencode v2 plugin that runs your models on **RunPod Serverless** (vLLM worker), one endpoint per model,
-created lazily on first use, scaled to zero when idle, and deleted when opencode shuts down.
+created lazily on first use, scaled to zero when idle, and configurable at runtime.
 
-- Pick `runpod/<model>` in `/models`. On the first request you get a **quote** (GPU, $/h, estimated cold start)
-  and a confirm dialog. Nothing is created before you say yes.
-- The endpoint uses `workers.min = 0`: after `idleTimeout` seconds without requests RunPod stops the worker and
-  billing stops. The next request re-warms it (no dialog).
+- Pick `runpod/<model>` in `/models`. The first request opens a dialog: **Provision on <GPU> — $/h** (with the
+  full quote: rate, estimated cold start, idle window cost), **Change GPU…** (every pool priced, fits / too small),
+  **Change idle timeout…**, **Cancel**. Nothing is created before you choose *Provision*.
+- GPU pools also appear as **variants** of each model in `/models`: selecting one provisions on that pool.
+- The endpoint uses `workers.min = 0`: after the idle timeout RunPod stops the worker and billing stops. The next
+  request re-warms it (no dialog).
 - Toasts show provisioning, cold-start progress, readiness, scale-down and deletion with the running spend; the
   footer shows `runpod <gpu> · warm|cold · $/h · ≈$spent`.
-- `/runpod-status`, `/runpod-up <model>`, `/runpod-down [model|all]`.
-- On opencode shutdown (plugin dispose) owned endpoints are deleted (`deleteOnExit`). Orphans from a crash are
-  cleaned up at the next start.
+- Endpoints are **kept** between sessions by default (zero workers cost $0) and re-adopted at start; set
+  `deleteOnExit: true` to delete them when opencode shuts down. Stale endpoints of a configured model (config
+  changed) are replaced automatically; endpoints of models no longer configured are only reported.
+
+## Commands
+
+| command | effect |
+|---|---|
+| `/runpod-status` | phase, endpoint id, GPU, $/h, session spend, billed $ per model; unmanaged `oc-runpod-*` endpoints |
+| `/runpod-up <model>` | provision + warm without the dialog |
+| `/runpod-down [model\|all]` | scale to zero and delete |
+| `/runpod-add <org/repo> [gpu-pool] [key=value …]` | add a model at runtime; without a pool the cheapest pool whose VRAM fits the weights is chosen |
+| `/runpod-set <model> key=value …` | change `gpu`, `gpuCount`, `context`, `output`, `idleTimeout`, `quantization`, `tools`, `family`, `toolParser`, `reasoningParser`, `weightsGb`, `name`, `hf` (`null` clears nullable keys) |
+| `/runpod-remove <model>` | runtime model: delete it and its endpoint; configured model: reset runtime overrides |
+
+Runtime changes (dialog choices, variants, `/runpod-set`, `/runpod-add`) persist in opencode's plugin storage and
+survive restarts; `opencode.json` stays the source of the static defaults. A change that alters the endpoint
+configuration (pool, context, parsers, …) deletes the live endpoint; the next request re-provisions with a dialog.
+Changing only the idle timeout patches the live endpoint.
 
 ## Install
 
@@ -4942,20 +6202,20 @@ repos on Hugging Face (vLLM does not serve GGUF-only repos well); FP8/AWQ/GPTQ v
 |---|---|---|
 | `apiKey` | env `RUNPOD_API_KEY` | RunPod API key (`{env:NAME}` / `{file:PATH}` accepted) |
 | `hfToken` | env `HF_TOKEN` | for gated repos |
-| `confirm` | `true` | ask before creating an endpoint |
+| `confirm` | `true` | show the provision dialog before creating an endpoint |
 | `confirmTimeoutSec` | `120` | unanswered dialog counts as declined |
-| `idleTimeout` | `120` | seconds a worker stays warm (billed) after a request |
+| `idleTimeout` | `120` | default seconds a worker stays warm (billed) after a request; per model via `models.<id>.idleTimeout` |
 | `workersMax` | `1` | parallel workers per endpoint |
 | `executionTimeoutSec` | `600` | per-request cap on RunPod |
 | `coldStartTimeoutSec` | `600` | give up warming after this |
-| `deleteOnExit` | `true` | delete owned endpoints on shutdown, remove stale ones on start |
+| `deleteOnExit` | `false` | delete owned endpoints on shutdown |
 | `adoptExisting` | `true` | reuse an `oc-runpod-*` endpoint whose config hash matches |
 | `maxHourlyRate` | – | refuse provisioning above this $/h |
 | `dataCenterIds` | `[]` | pin regions, e.g. `["EU-RO-1"]` |
 | `minCudaVersion` | `"12.8"` | host CUDA floor |
 | `workerImage` | `runpod/worker-v1-vllm:v2.27.2` | vLLM worker image |
 | `flashboot` | `true` | RunPod FlashBoot |
-| `models.<id>` | – | `hf`, `gpu` (pool id), `gpuCount`, `context`, `output`, `tools`, `family`, `toolParser`, `reasoningParser`, `quantization`, `weightsGb`, `env` |
+| `models.<id>` | – | `hf`, `gpu` (pool id), `gpuCount`, `context`, `output`, `tools`, `family`, `toolParser`, `reasoningParser`, `quantization`, `weightsGb`, `idleTimeout`, `env` |
 
 GPU pools and static fallback prices: `AMPERE_16` $0.58 · `AMPERE_24` $0.69 · `ADA_24` $1.10 · `ADA_32_PRO` $1.58 ·
 `AMPERE_48` $1.22 · `ADA_48_PRO` $1.75 · `AMPERE_80` $2.72 · `ADA_80_PRO` $4.79 · `BLACKWELL_96` $3.49 · `HOPPER_141` $5.93
@@ -4963,23 +6223,23 @@ GPU pools and static fallback prices: `AMPERE_16` $0.58 · `AMPERE_24` $0.69 · 
 
 ## Cost model
 
-You pay RunPod per second while a worker runs: cold start (image + weights load), your requests, and the
-`idleTimeout` window after each request. Zero workers cost nothing. Endpoint records are kept in opencode's plugin
-storage; the config hash `OPENCODE_RUNPOD_HASH` on each endpoint lets the plugin recognise and reuse or replace them.
+You pay RunPod per second while a worker runs: cold start (image + weights load), your requests, and the idle window
+after each request. Zero workers cost nothing. Endpoint records live in opencode's plugin storage; the config hash
+`OPENCODE_RUNPOD_HASH` on each endpoint lets the plugin recognise, reuse or replace them.
 
 ## Caveats
 
 - The first request after a cold start waits for the worker (minutes for 30B-class models). The request timeout is
   raised to 10 minutes for this provider.
-- opencode runs a background service; `deleteOnExit` fires when the service disposes the plugin (`opencode service stop|restart`,
-  location shutdown), not necessarily when you close the TUI. Scaled-to-zero endpoints cost $0 either way; use
-  `/runpod-down` to remove one explicitly.
-- Two opencode locations loading the plugin adopt the same endpoints by name; the last one out deletes them.
+- opencode runs a background service; `deleteOnExit` (when enabled) fires when the service disposes the plugin
+  (`opencode service stop|restart`, location shutdown), not necessarily when you close the TUI.
+- Two opencode locations loading the plugin adopt the same endpoints by name; endpoints of models one location does
+  not know are reported as orphans, never deleted automatically.
 
 ## Development
 
 Hexagonal layout: `src/core` (domain + `EndpointService`, ports only), `src/adapters/driven` (RunPod, vLLM recipe,
-Hugging Face, opencode storage/RPC, system), `src/adapters/driving` (opencode plugin, TUI, RPC contract).
+Hugging Face, opencode storage/RPC/catalog, system), `src/adapters/driving` (opencode plugin, TUI, RPC contract).
 
 ```sh
 npm install
@@ -4989,7 +6249,7 @@ RUNPOD_API_KEY=... npm run smoke   # real endpoint, ~$0.05
 Dev config: `.opencode/opencode.jsonc` loads this checkout with a tiny test model when opencode runs in this directory.
 ```
 
-Adjust the caveat about TUI exit to what Task 15 step 7.8 observed.
+Adjust the caveat about TUI exit to what Task 15 step 8.10 observed.
 
 - [ ] **Step 4: Typecheck, tests, commit**
 
@@ -5001,7 +6261,7 @@ git commit -m "docs: README, example config and real-API smoke script"
 
 - [ ] **Step 5: Install into the user's global opencode config (manual, user-owned file)**
 
-Add to `~/.config/opencode/opencode.json` (JSON, no comments) a `plugins` entry pointing at this checkout, with the
+Add to `~/.config/opencode/opencode.json` (JSON, no comments) a `plugins` entry pointing at the checkout, with the
 user's real model set (start from `examples/opencode.jsonc`, replace the `REPLACE-WITH…` repos with real safetensors
 repo ids or drop those models):
 

@@ -19,9 +19,10 @@ Decisions already made with the user:
 |---|---|
 | Model class | ~30B class (user's homelab set, faster) + any HF model id via config |
 | Weights | HF pull at cold start, quantized (FP8/AWQ/GPTQ) preferred; no network volumes |
-| Teardown | RunPod scale-to-zero via `idleTimeout`; endpoint deleted on opencode exit; re-created on next use |
+| Teardown | RunPod scale-to-zero via `idleTimeout`; endpoints kept across sessions and re-adopted (zero workers = $0); `deleteOnExit` (default false, user decision 2026-09-26) deletes them at shutdown; `/runpod-down` deletes explicitly |
 | Cost guard | Ask before **every provision** (endpoint creation) with a quote; re-warm after idle needs no re-ask |
-| Confirm UX | Approach A: server plugin + TUI plugin bridged by RPC (native confirm dialog, toasts, footer widget) |
+| Confirm UX | Approach A: server plugin + TUI plugin bridged by RPC (native dialogs, toasts, footer widget) |
+| Runtime model config (added 2026-09-26) | (a) GPU pool + idle timeout chosen in the provision dialog, (b) GPU tiers exposed as opencode model variants, (c) `/runpod-add`, `/runpod-set`, `/runpod-remove` commands; all persisted in plugin storage (§5.7) |
 
 ## 2. Facts the design relies on (verified 2026-09-26)
 
@@ -72,23 +73,25 @@ composition root that wires them. An architecture test enforces the dependency r
 runpod-opencode/                 npm: opencode-runpod (ESM, TypeScript, no build step)
 ├─ package.json                  exports ".": ./index.ts, "./tui": ./tui.ts, "./rpc": ./rpc.ts
 ├─ index.ts  tui.ts  rpc.ts      root re-exports (a local directory path loads via Host.resolve too)
-├─ src/core/domain/              pure: model.ts (ModelConfig, Settings), endpoint.ts (Phase, WorkerRecipe, EndpointSpec,
-│                                EndpointRecord, specHash, endpointName), quote.ts (PoolRate, Quote, buildQuote,
-│                                estimateColdStartSec, idleWindowUsd), spend-meter.ts, events.ts (StateEvent, ModelStatus, StatusReport)
+├─ src/core/domain/              pure: model.ts (ModelConfig, Settings, ModelOverrides, applyOverrides, deriveModelID, idleTimeoutFor),
+│                                endpoint.ts (Phase, WorkerRecipe, EndpointSpec, EndpointRecord, specHash, endpointName), quote.ts (PoolRate,
+│                                Quote, buildQuote, estimateColdStartSec, idleWindowUsd), provision.ts (GpuOption, ProvisionProposal,
+│                                ProvisionDecision, buildProposal, gpuVariantsFor), spend-meter.ts, events.ts (StateEvent, ModelStatus, StatusReport)
 ├─ src/core/ports/               driven: compute-provider.ts (ComputeProviderPort, ComputeError), price-catalog.ts, worker-recipe.ts,
-│                                weights-info.ts, state-store.ts, clock.ts, confirmation.ts, notifier.ts, logger.ts
+│                                weights-info.ts, state-store.ts, clock.ts, confirmation.ts, notifier.ts, logger.ts, catalog-publisher.ts
 │                                driving: driving.ts (ModelRoutingPort, OperationsPort, LifecyclePort)
 ├─ src/core/application/         endpoint-service.ts — EndpointService: the lifecycle state machine, implements the driving ports
 ├─ src/adapters/driven/runpod/   http.ts (REST v2 client), compute-provider.ts (ComputeProviderPort), pools.ts (pool table),
 │                                price-catalog.ts (PriceCatalogPort: live catalog + static fallback)
 ├─ src/adapters/driven/vllm/     presets.ts (model families → parsers), recipe.ts (WorkerRecipePort → image/env/disk)
 ├─ src/adapters/driven/huggingface/ weights-info.ts (WeightsInfoPort)
-├─ src/adapters/driven/opencode/ state-store.ts (ctx.storage), notifier.ts (RPC events), confirmation.ts (ConfirmBroker + RPC)
+├─ src/adapters/driven/opencode/ state-store.ts (ctx.storage), notifier.ts (RPC events), confirmation.ts (ConfirmBroker + RPC),
+│                                catalog-publisher.ts (holds the published model list, triggers provider.reload)
 ├─ src/adapters/driven/system/   clock.ts, logger.ts
 ├─ src/adapters/driving/rpc/     contract.ts (zod DTOs typed against domain types, RunpodRpc), format.ts (text for UIs)
 ├─ src/adapters/driving/opencode/ config.ts (options → Settings + secrets), provider-catalog.ts (Provider.Info/Model.Info),
 │                                commands.ts (/runpod-*), plugin.ts (composition root: hook, RPC methods, lifecycle)
-├─ src/adapters/driving/tui/     plugin.tsx (dialog, toasts, footer slots), toasts.ts (pure toast decisions)
+├─ src/adapters/driving/tui/     plugin.tsx (dialogs, toasts, footer slots), toasts.ts (pure toast decisions), choose.ts (provision dialog loop)
 ├─ test/fakes/                   one fake per driven port + fixtures
 ├─ test/*.test.ts                unit tests; architecture.test.ts enforces the dependency rule
 ├─ scripts/smoke.ts              opt-in real-API smoke test (needs RUNPOD_API_KEY, spends < $0.10)
@@ -112,19 +115,25 @@ interface ComputeProviderPort {                     // RunPod serverless today; 
   health(id: string): Promise<HealthSnapshot>       // { initializing, running, idle, throttled }
   warmup(id: string, modelID: string, signal: AbortSignal): Promise<void>   // throws ComputeError { kind: "transient" | "fatal" }
   diagnostics(id: string): Promise<string | null>   // unhealthy worker log tail
+  setIdleTimeout(id: string, seconds: number): Promise<void>   // PATCH workers.idleTimeout on a live endpoint
   billedUsd(id: string): Promise<number | null>
   inferenceBaseURL(id: string): string
 }
 interface PriceCatalogPort { rate(pool: string): Promise<PoolRate>; knownPools(): readonly string[] }   // PoolRate { ratePerHour, source, vramGb, label }
 interface WorkerRecipePort { recipe(model: ModelConfig, settings: Settings, weightsGb: number | null): WorkerRecipe }  // { image, env, secretEnv, diskGb }
 interface WeightsInfoPort { weightsGb(model: ModelConfig): Promise<number | null> }
-interface StateStorePort { get<T>(key: string): Promise<T | undefined>; set(key: string, value: unknown): Promise<void>; remove(key: string): Promise<void> }
+interface StateStorePort { get<T>(key: string): Promise<T | undefined>; set(key: string, value: unknown): Promise<void>; remove(key: string): Promise<void>; keys(prefix: string): Promise<string[]> }
 interface ClockPort { now(): number; sleep(ms: number): Promise<void>; setTimer(fn: () => void, ms: number): unknown; clearTimer(id: unknown): void }
-interface ConfirmationPort { ask(quote: Quote): Promise<boolean> }
+interface ConfirmationPort { ask(proposal: ProvisionProposal): Promise<ProvisionDecision> }   // proposal = quote + priced GPU options + idle choices; decision = { accepted: false } | { accepted: true; overrides: { gpu?, idleTimeout? } }
+interface CatalogPublisherPort { publish(models: readonly PublishedModel[]): Promise<void> }   // PublishedModel { config: ModelConfig; variants: string[] } → opencode provider reload
 interface NotifierPort { state(event: StateEvent): void; notice(level: "info" | "warning" | "error", message: string): void }
 interface LoggerPort { info(message: string, extra?: Record<string, unknown>): void; warn(message: string, extra?: Record<string, unknown>): void }
-interface ModelRoutingPort { ensureReady(modelID: string, opts?: { skipConfirm?: boolean }): Promise<string> }  // returns inference base URL
-interface OperationsPort { status(): Promise<StatusReport>; up(modelID: string): Promise<string>; down(modelID?: string): Promise<string[]> }
+interface ModelRoutingPort { ensureReady(modelID: string, opts?: { skipConfirm?: boolean; gpu?: string }): Promise<string> }  // gpu = selected variant (pool id); returns inference base URL
+interface OperationsPort {
+  status(): Promise<StatusReport>; up(modelID: string): Promise<string>; down(modelID?: string): Promise<string[]>
+  add(input: { hf: string; gpu?: string; overrides?: ModelOverrides }): Promise<ModelConfig>; set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig>
+  remove(modelID: string): Promise<"removed" | "reset">; models(): readonly ModelConfig[]
+}
 interface LifecyclePort { start(): Promise<void>; stop(budgetMs?: number): Promise<void> }
 ```
 
@@ -151,7 +160,7 @@ loads the absolute repo path with the real model set. `opencode service restart`
   "workersMax": 1,                          // parallel workers cap (more = more $)
   "executionTimeoutSec": 600,               // per-request cap on RunPod
   "coldStartTimeoutSec": 600,               // give up warm-up after this
-  "deleteOnExit": true,                     // delete owned endpoints when opencode shuts down
+  "deleteOnExit": false,                    // delete owned endpoints when opencode shuts down; default false — a zero-worker endpoint costs $0 and is re-adopted next start
   "adoptExisting": true,                    // reuse a matching oc-runpod-* endpoint found at startup
   "maxHourlyRate": 3.0,                     // refuse provisioning above this $/h (optional)
   "dataCenterIds": [],                      // optional pinning, e.g. ["EU-RO-1"]
@@ -171,6 +180,7 @@ loads the absolute repo path with the real model set. `opencode service restart`
       "reasoningParser": null,
       "quantization": "fp8",                // vLLM QUANTIZATION or null
       "weightsGb": null,                    // override HF size lookup
+      "idleTimeout": null,                  // per-model override of the global idleTimeout (seconds)
       "env": { "GPU_MEMORY_UTILIZATION": "0.92" }
     }
   }
@@ -202,9 +212,11 @@ cold ──ensureReady──▶ confirming ──yes──▶ creating ──▶
   └───────────── deleting ◀─── down / exit ◀─────────────────┴──────── idle  ──next request──▶ warming (no confirm)
 ```
 - `ensureReady(modelID)` → inference base URL. Concurrent callers share one in-flight promise per model. All I/O goes through ports: `ComputeProviderPort` (create/warm/health/delete), `PriceCatalogPort` + `WeightsInfoPort` (quote), `WorkerRecipePort` (image/env/disk), `StateStorePort` (records), `ClockPort` (timers), `ConfirmationPort`, `NotifierPort`, `LoggerPort`.
-- **confirming**: build quote (§5.4); if `confirm` is false or the call comes from `/runpod-up`, skip. Otherwise emit RPC event
-  `confirm.requested {requestID, quote}` and await RPC method `confirm {requestID, accepted}` up to `confirmTimeoutSec`;
+- **confirming**: build quote (§5.4) and a **proposal** (the quote plus every known GPU pool priced for this model with a fits flag, and
+  idle-timeout choices 30/60/120/300/600/1800 s); if `confirm` is false or the call comes from `/runpod-up`, skip. Otherwise emit RPC event
+  `confirm.requested {requestID, proposal}` and await RPC method `confirm {requestID, accepted, overrides?}` up to `confirmTimeoutSec`;
   timeout or `accepted:false` → throw `RunPod: provisioning of <model> declined/unanswered. Run /runpod-up <model> or set options.confirm=false.`
+  Accepted `overrides` (gpu, idleTimeout) are applied through `set()` (§5.7), the quote is rebuilt and re-checked against `maxHourlyRate`, then creation proceeds.
 - **creating**: `compute.create(spec)`; the RunPod adapter maps `EndpointSpec` to `POST /v2/serverless`: name `oc-runpod-<modelID>`, `type QUEUE`, `gpu {pools:[gpu], count, minCudaVersion}`,
   `image`, `env` = `{ MODEL_NAME: hf, OPENAI_SERVED_MODEL_NAME_OVERRIDE: modelID, MAX_MODEL_LEN: context, ENABLE_AUTO_TOOL_CHOICE, TOOL_CALL_PARSER,
   REASONING_PARSER?, QUANTIZATION?, HF_TOKEN?, OPENCODE_RUNPOD: "1", OPENCODE_RUNPOD_HASH: envHash, ...userEnv }`, `disk = ceil(weightsGb*1.15)+10`,
@@ -219,9 +231,11 @@ cold ──ensureReady──▶ confirming ──yes──▶ creating ──▶
   If `now - lastRequestAt > idleTimeout + 15 s` the worker has most likely scaled to zero: run warm-up again (toast "Cold start…", no confirm).
 - **deleting** (`/runpod-down`, exit): `PATCH workers {min 0, max 0}` then `DELETE`; clear storage; emit final `state {phase:"deleted", spendUsd}`.
 - `start()` reconcile: `GET /v2/serverless`, take names `oc-runpod-*`. Name matches a configured model and `OPENCODE_RUNPOD_HASH` equals the
-  current envHash → adopt (state `idle`) when `adoptExisting`; otherwise, or when the hash differs → delete when `deleteOnExit`
-  (log it), else leave untouched and report in status.
-- `stop(budgetMs = 10000)` (plugin cleanup / opencode shutdown): when `deleteOnExit`, delete all owned endpoints within the budget, best effort, errors logged.
+  current spec hash → adopt (state `idle`) when `adoptExisting`. Name matches a configured model but the hash differs, or a second endpoint
+  exists for the same model → stale: deleted (it would be replaced on next use anyway; $0 while idle). Name matches no configured model
+  (removed from config, or another opencode location's model) → never deleted automatically; reported as an orphan in `/runpod-status`.
+- `stop(budgetMs = 10000)` (plugin cleanup / opencode shutdown): when `deleteOnExit` (default **false**), delete all owned endpoints within the
+  budget, best effort, errors logged. With the default, endpoints survive shutdown at $0 and are re-adopted by the next `start()`.
 
 ### 5.3 model.request hook (driving adapter)
 `ctx.session.hook("model.request", async (e) => { e.baseURL = await routing.ensureReady(e.model.id) }, { providerID: "runpod" })` where `routing: ModelRoutingPort` is the `EndpointService`.
@@ -239,17 +253,38 @@ Errors thrown here surface in the session as the request error. No changes to he
 - `/runpod-status` — per configured model: state, endpoint id, GPU, $/h, warm/cold, session spend (est. + billed), orphans found.
 - `/runpod-up <model>` — provision without dialog (explicit command = consent), then warm up.
 - `/runpod-down [model|all]` — scale to zero and delete.
+- `/runpod-add <hf-repo> [gpu-pool] [key=value …]` — add a model at runtime (§5.7); without a pool the cheapest pool whose VRAM × 0.85 ≥ weights is chosen.
+- `/runpod-set <model> key=value [key=value …]` — change `gpu`, `gpuCount`, `context`, `output`, `idleTimeout`, `quantization`, `tools`, `family`, `toolParser`, `reasoningParser`, `weightsGb`, `name`, `hf` at runtime (`null` clears a nullable key).
+- `/runpod-remove <model>` — runtime model: deleted with its endpoint; static model: overrides cleared back to `opencode.json`.
 Replies are posted with `ctx.session.synthetic` if verified not to trigger a model turn (§9); otherwise via RPC `notice` event (TUI toast) only.
 
 ### 5.6 RPC contract (`adapters/driving/rpc/contract.ts`, zod DTOs typed against the domain types)
-- methods: `status() → {models:[{modelID, phase, endpointID?, gpu, ratePerHour, spendUsd, billedUsd?, lastRequestAt?}]}`,
-  `up({modelID})`, `down({modelID?})`, `confirm({requestID, accepted})`.
-- events: `confirm.requested {requestID, modelID, quote:{gpu, gpuCount, ratePerHour, estColdStartSec, idleTimeout, idleWindowUsd, weightsGb?, warnings:[]}}`,
-  `state {modelID, phase, detail?, elapsedSec?, spendUsd, ratePerHour}`, `notice {level, message}`.
+- methods: `status() → StatusReport`, `up({modelID})`, `down({modelID?})`, `confirm({requestID, accepted, overrides?: {gpu?, idleTimeout?}})`.
+- events: `confirm.requested {requestID, proposal: {quote, gpuOptions:[{pool, label, ratePerHour, rateSource, vramGb, fits, estColdStartSec, current}], idleTimeoutChoices}}`,
+  `state {modelID, phase, detail, elapsedSec, spendUsd, ratePerHour, gpu, gpuLabel}`, `notice {level, message}`.
+
+### 5.7 Runtime model configuration
+Three entry points, one mechanism. The service keeps the **effective** config per model id: the static `opencode.json` entry
+merged with persisted `ModelOverrides` (`overrides/<id>` in plugin storage) or, for models added at runtime, a full `ModelConfig`
+(`models/<id>`). `start()` loads both before reconciling. After every change the service publishes the effective list plus GPU
+**variants** through `CatalogPublisherPort`; the opencode adapter calls `provider.reload()`, so `/models` updates live.
+- **Dialog** (a): the TUI runs a `dialog.select` loop — *Provision on <pool> — $/h* · *Change GPU…* (every pool, priced, fits flag) ·
+  *Change idle timeout (N s)…* · *Cancel*. Accepted `overrides` are persisted like any `set()`.
+- **Variants** (b): each published model lists as variants the pool ids whose VRAM ≥ the effective pool's VRAM, sorted by price.
+  Selecting a variant in `/models` makes `model.request` carry `model.variant`; the hook calls `ensureReady(id, { gpu: variant })`.
+  A variant different from the effective pool is applied as `set(id, { gpu })` before provisioning.
+- **Commands** (c): see §5.5. `set()` rules: unknown pool or out-of-range value → rejected with the known pools / bounds; if the model
+  has an endpoint and the change alters the spec hash (hf, gpu, gpuCount, context, tools, parsers, quantization, env) the endpoint is
+  deleted (notice: re-provision on next use, with confirm); if only `idleTimeout` changed the live endpoint is patched via
+  `setIdleTimeout`. `add()` derives the id from the repo name (`Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` → `qwen3-coder-30b-a3b-instruct-fp8`),
+  uses the config-schema defaults, and rejects duplicates. `remove()` deletes a runtime model (and its endpoint) or resets a static
+  model's overrides.
 
 ## 6. TUI plugin (`tui.ts`)
-- `client.rpc(RunpodRpc).events.on("confirm.requested")` → `ui.dialog.confirm({ title: "RunPod: provision GPU endpoint?", message: "<model> on <gpu>×<n> — $<rate>/h while warm · cold start ≈<m> min · idle window <s>s (≈$<x>) · weights ≈<gb> GB[ · WARN …]" })`
-  → `rpc.confirm({ requestID, accepted: ok === true })`. Multiple TUIs: first reply wins; server ignores later ones.
+- `client.rpc(RunpodRpc).events.on("confirm.requested")` → `chooseProvision(ui.dialog, proposal)`: a `dialog.select` loop
+  (*Provision on <pool> — $/h* with the quote as description · *Change GPU…* → select over `proposal.gpuOptions` · *Change idle timeout…* →
+  select over `idleTimeoutChoices` priced per idle window · *Cancel*) → `rpc.confirm({ requestID, accepted, overrides })`.
+  Multiple TUIs: first reply wins; server ignores later ones.
 - `events.on("state")` → `ui.toast.show` on phase transitions: creating ("Provisioning A6000 48GB · $1.22/h"), warming progress every 30 s
   ("Cold start 90s · initializing 1"), ready ("Ready in 142s"), idle ("Scaled to zero · ≈$0.11 this session"), deleted ("Deleted · ≈$0.31"), errors.
 - Footer: `ui.slot({ append: "prompt.footer.status", render })` showing the active runpod model only:
@@ -266,11 +301,11 @@ Replies are posted with `ctx.session.synthetic` if verified not to trigger a mod
 | Confirm declined / timeout | throw actionable message; state back to `cold`, nothing created |
 | Cold start timeout / unhealthy worker | throw with elapsed + worker log tail; endpoint kept for `/runpod-down` or retry |
 | `maxHourlyRate` exceeded / weights don't fit | refuse before dialog with the numbers |
-| Cleanup failure at exit | logged; never blocks shutdown; next startup reconcile deletes orphans |
+| Cleanup failure at exit (`deleteOnExit` on) | logged; never blocks shutdown; next startup reconcile adopts or replaces the leftovers |
 | Two plugin instances (global + project config) | both adopt by name; last one out deletes; documented caveat |
 
 ## 8. Testing
-- Unit (`node --test`, TS): domain (specHash, quote math, SpendMeter, events); `EndpointService` against fakes for every port (confirm accept/decline/timeout, blocked quotes, in-flight dedupe, warm-up retry/timeout/diagnostics, idle re-warm, reconcile adopt/stale/orphan, teardown order, status); each driven adapter against a fake `fetch` (RunPod HTTP mapping, RFC 9457 errors, retries, pagination; vLLM recipe env/parsers/disk; HF sizes); driving adapters (config resolution incl. secret placeholders, provider/model builders, command parsing/replies, RPC DTO round-trips, toast decisions); `architecture.test.ts` enforcing the dependency rule.
+- Unit (`node --test`, TS): domain (specHash, quote math, SpendMeter, events); `EndpointService` against fakes for every port (confirm accept/decline/timeout, blocked quotes, in-flight dedupe, warm-up retry/timeout/diagnostics, idle re-warm, reconcile adopt/stale/orphan, teardown order, status); each driven adapter against a fake `fetch` (RunPod HTTP mapping, RFC 9457 errors, retries, pagination; vLLM recipe env/parsers/disk; HF sizes); driving adapters (config resolution incl. secret placeholders and `key=value` override parsing, provider/model builders incl. variants, command parsing/replies for status/up/down/add/set/remove, RPC DTO round-trips, toast decisions, the `chooseProvision` dialog loop against a scripted dialog); runtime config in the service (overrides persisted, hash-changing edits tear down, idle-only edits patch, `add` picks the cheapest fitting pool, `remove` vs reset, variants published); `architecture.test.ts` enforcing the dependency rule.
 - Smoke (opt-in, `RUNPOD_API_KEY`): `scripts/smoke.ts` creates `Qwen/Qwen3-0.6B` on `AMPERE_16`, warms, sends one request, deletes; asserts spend < $0.10.
 - Manual e2e: load via local path in the user's global config; `/models` shows `runpod/*`; pick one, prompt → dialog → toasts → answer; `/runpod-status`; quit → endpoint gone in RunPod console.
 
@@ -281,5 +316,5 @@ Replies are posted with `ctx.session.synthetic` if verified not to trigger a mod
 4. Exact `Provider.Info` / `Model.Info` required fields via `Provider.Info.empty(id)` + tsc.
 
 ## 10. Out of scope (v1)
-Network volumes and pod (non-serverless) instances; automatic GPU tier selection; daily/weekly budget caps; load-balancer endpoints;
+Network volumes and pod (non-serverless) instances; daily/weekly budget caps; load-balancer endpoints;
 SGLang worker env mapping (image is configurable but env keys are vLLM's); v1 plugin API; per-token cost accounting in opencode's session $.

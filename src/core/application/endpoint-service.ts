@@ -1,14 +1,14 @@
-import { buildEndpointSpec, type EndpointRecord, type Phase } from "../domain/endpoint.ts"
-import type { StateEvent } from "../domain/events.ts"
-import { applyOverrides, idleTimeoutFor, type ModelConfig, type ModelOverrides, type Settings } from "../domain/model.ts"
+import { buildEndpointSpec, modelIDFromName, specHashFor, type EndpointRecord, type Phase } from "../domain/endpoint.ts"
+import type { ModelStatus, StateEvent, StatusReport, WorkerCounts } from "../domain/events.ts"
+import { applyOverrides, deriveModelID, findModel, idleTimeoutFor, type ModelConfig, type ModelOverrides, type Settings } from "../domain/model.ts"
 import { buildProposal, gpuVariantsFor, type PoolPricing, type ProvisionOverrides } from "../domain/provision.ts"
-import { DEFAULT_WEIGHTS_GB, buildQuote, type PoolRate, type Quote } from "../domain/quote.ts"
+import { DEFAULT_WEIGHTS_GB, buildQuote, fitsPool, type PoolRate, type Quote } from "../domain/quote.ts"
 import { SpendMeter } from "../domain/spend-meter.ts"
 import type { CatalogPublisherPort, PublishedModel } from "../ports/catalog-publisher.ts"
 import type { ClockPort } from "../ports/clock.ts"
 import { ComputeError, type ComputeProviderPort } from "../ports/compute-provider.ts"
 import type { ConfirmationPort } from "../ports/confirmation.ts"
-import type { ModelRoutingPort } from "../ports/driving.ts"
+import type { AddModelInput, LifecyclePort, ModelRoutingPort, OperationsPort } from "../ports/driving.ts"
 import type { LoggerPort } from "../ports/logger.ts"
 import type { NotifierPort } from "../ports/notifier.ts"
 import type { PriceCatalogPort } from "../ports/price-catalog.ts"
@@ -20,6 +20,8 @@ import type { WorkerRecipePort } from "../ports/worker-recipe.ts"
 export const IDLE_GRACE_MS = 15_000
 export const HEALTH_POLL_MS = 3_000
 export const WARMUP_RETRY_MS = 5_000
+/** How long a billed-$ lookup is reused by status(). */
+export const BILLING_TTL_MS = 5 * 60_000
 
 export interface ServicePorts {
   compute: ComputeProviderPort | null
@@ -58,7 +60,9 @@ export const weightsKey = (hf: string) => `weights/${hf}`
 export const overridesKey = (modelID: string) => `overrides/${modelID}`
 export const modelKey = (modelID: string) => `models/${modelID}`
 
-export class EndpointService implements ModelRoutingPort {
+export class EndpointService implements ModelRoutingPort, OperationsPort, LifecyclePort {
+  private orphans: { id: string; name: string }[] = []
+  private readonly billedCache = new Map<string, { at: number; usd: number | null }>()
   protected readonly settings: Settings
   protected readonly ports: ServicePorts
   protected readonly states = new Map<string, ModelState>()
@@ -78,11 +82,250 @@ export class EndpointService implements ModelRoutingPort {
   async ensureReady(modelID: string, opts: { skipConfirm?: boolean; gpu?: string } = {}): Promise<string> {
     const st = this.state(modelID)
     if (st.inflight) return st.inflight
-    const run = this.run(st, opts).finally(() => {
+    const run = (async () => {
+      if (opts.gpu !== undefined && opts.gpu !== st.model.gpu) await this.set(modelID, { gpu: opts.gpu })
+      return this.run(st, opts)
+    })().finally(() => {
       st.inflight = null
     })
     st.inflight = run
     return run
+  }
+
+  up(modelID: string): Promise<string> {
+    return this.ensureReady(modelID, { skipConfirm: true })
+  }
+
+  models(): readonly ModelConfig[] {
+    return [...this.states.values()].map((st) => st.model)
+  }
+
+  /** Load persisted runtime config, reconcile remote endpoints, publish the catalog. */
+  async start(): Promise<void> {
+    for (const st of this.states.values()) {
+      const stored = await this.ports.store.get<ModelOverrides>(overridesKey(st.model.id))
+      if (stored && Object.keys(stored).length > 0) st.model = applyOverrides(st.model, stored)
+    }
+    for (const key of await this.ports.store.keys("models/")) {
+      const config = await this.ports.store.get<ModelConfig>(key)
+      if (!config || this.states.has(config.id)) continue
+      this.newState(config)
+      this.runtimeIDs.add(config.id)
+    }
+    const compute = this.ports.compute
+    if (compute) {
+      this.orphans = []
+      const remote = await compute.list()
+      const byId = new Map(remote.map((ep) => [ep.id, ep] as const))
+      for (const st of this.states.values()) {
+        const stored = await this.ports.store.get<EndpointRecord>(recordKey(st.model.id))
+        if (!stored) continue
+        const ep = byId.get(stored.endpointID)
+        if (ep && ep.hash === this.expectedHash(st.model)) {
+          st.record = stored
+          st.rate = await this.rateFor(st.model)
+          this.setPhase(st, "idle", "restored endpoint from storage")
+        } else {
+          await this.ports.store.remove(recordKey(st.model.id))
+        }
+      }
+      for (const ep of remote) {
+        const modelID = modelIDFromName(ep.name)
+        if (modelID === null) continue
+        const st = this.states.get(modelID)
+        if (st?.record?.endpointID === ep.id) continue
+        const matches = st !== undefined && ep.hash !== null && ep.hash === this.expectedHash(st.model)
+        if (st && !st.record && this.settings.adoptExisting && matches) {
+          st.record = { endpointID: ep.id, name: ep.name, modelID, gpu: st.model.gpu, gpuCount: st.model.gpuCount, hash: ep.hash!, createdAt: this.ports.clock.now(), spendUsd: 0 }
+          await this.ports.store.set(recordKey(modelID), st.record)
+          st.rate = await this.rateFor(st.model)
+          this.setPhase(st, "idle", "adopted existing endpoint")
+          continue
+        }
+        // Ours (a configured model) but stale — different config or a duplicate: it would be replaced on next use anyway.
+        const stale = st !== undefined && (!matches || st.record !== null)
+        if (stale) {
+          try {
+            await compute.delete(ep.id)
+            this.ports.logger.info("deleted stale endpoint", { id: ep.id, name: ep.name })
+            continue
+          } catch (error) {
+            this.ports.logger.warn("failed to delete stale endpoint", { id: ep.id, error: String(error) })
+          }
+        }
+        // Unknown model (removed from config, or another opencode location's): never deleted automatically.
+        this.orphans.push({ id: ep.id, name: ep.name })
+      }
+    }
+    await this.publish()
+  }
+
+  /** Best-effort teardown within a time budget; used at plugin shutdown. */
+  async stop(budgetMs = 10_000): Promise<void> {
+    if (!this.settings.deleteOnExit) return
+    await Promise.race([
+      this.down().catch((error: unknown) => {
+        this.ports.logger.warn("shutdown cleanup failed", { error: String(error) })
+      }),
+      this.ports.clock.sleep(budgetMs),
+    ])
+  }
+
+  async down(modelID?: string): Promise<string[]> {
+    const compute = this.compute()
+    const targets = modelID === undefined ? [...this.states.values()] : [this.state(modelID)]
+    const deleted: string[] = []
+    for (const st of targets) {
+      const record = st.record
+      if (!record) continue
+      this.setPhase(st, "deleting", `deleting ${record.endpointID}`)
+      try {
+        await compute.scaleToZero(record.endpointID)
+      } catch (error) {
+        this.ports.logger.warn("scale-to-zero before delete failed", { error: String(error) })
+      }
+      try {
+        await compute.delete(record.endpointID)
+      } catch (error) {
+        this.setPhase(st, "error", `delete failed: ${(error as Error).message}`)
+        throw error
+      }
+      if (st.idleTimer !== null) {
+        this.ports.clock.clearTimer(st.idleTimer)
+        st.idleTimer = null
+      }
+      st.meter.stop(this.ports.clock.now())
+      st.record = null
+      await this.ports.store.remove(recordKey(st.model.id))
+      this.setPhase(st, "cold", `deleted · ≈$${st.meter.usd().toFixed(2)} this session`)
+      deleted.push(st.model.id)
+    }
+    return deleted
+  }
+
+  async status(): Promise<StatusReport> {
+    const models: ModelStatus[] = []
+    for (const st of this.states.values()) {
+      st.rate = await this.rateFor(st.model)
+      let billedUsd: number | null = null
+      let workers: WorkerCounts | null = null
+      if (st.record && this.ports.compute) {
+        billedUsd = await this.billedFor(st.record.endpointID)
+        // Live counts only matter (and only cost an API call) while a worker may be running.
+        if (st.phase === "warming" || st.phase === "ready") workers = await this.ports.compute.health(st.record.endpointID).catch(() => null)
+      }
+      models.push({
+        modelID: st.model.id,
+        phase: st.phase,
+        detail: st.detail,
+        spendUsd: round(st.meter.usd()),
+        ratePerHour: this.hourly(st),
+        gpu: st.model.gpu,
+        gpuLabel: st.rate.label,
+        endpointID: st.record?.endpointID ?? null,
+        gpuCount: st.model.gpuCount,
+        billedUsd,
+        lastRequestAt: st.lastRequestAt,
+        workers,
+      })
+    }
+    return { models, orphans: [...this.orphans] }
+  }
+
+  async add(input: AddModelInput): Promise<ModelConfig> {
+    const id = deriveModelID(input.hf)
+    if (this.states.has(id)) throw new Error(`RunPod: model "${id}" already exists (use /runpod-set ${id} key=value to change it)`)
+    const pools = this.ports.catalog.knownPools()
+    const draft: ModelConfig = {
+      id,
+      name: `${id} (RunPod)`,
+      hf: input.hf,
+      gpu: input.gpu ?? "",
+      gpuCount: 1,
+      context: 32768,
+      output: 8192,
+      tools: true,
+      family: null,
+      toolParser: undefined,
+      reasoningParser: undefined,
+      quantization: null,
+      weightsGb: null,
+      idleTimeout: null,
+      env: {},
+    }
+    const config = applyOverrides(draft, input.overrides ?? {})
+    if (config.gpu === "") {
+      const weightsGb = config.weightsGb ?? (await this.weightsGb(config))
+      if (weightsGb === null) {
+        throw new Error(`RunPod: cannot size ${input.hf} (weights unknown); pass a GPU pool explicitly (known: ${pools.join(", ")})`)
+      }
+      const fitting = (await this.pricing())
+        .filter((p) => p.rate.ratePerHour > 0 && fitsPool(weightsGb, p.rate.vramGb, config.gpuCount) === true)
+        .sort((a, b) => a.rate.ratePerHour - b.rate.ratePerHour)
+      if (fitting.length === 0) {
+        throw new Error(`RunPod: no known GPU pool fits ≈${weightsGb} GB of weights with gpuCount ${config.gpuCount}; pass a pool and gpuCount explicitly`)
+      }
+      config.gpu = fitting[0]!.pool
+      config.weightsGb = weightsGb
+    }
+    this.validateOverrides({ gpu: config.gpu, gpuCount: config.gpuCount, context: config.context, output: config.output, idleTimeout: config.idleTimeout })
+    this.newState(config)
+    this.runtimeIDs.add(id)
+    await this.ports.store.set(modelKey(id), config)
+    await this.publish()
+    return config
+  }
+
+  async set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig> {
+    const st = this.state(modelID)
+    this.validateOverrides(overrides)
+    const next = applyOverrides(st.model, overrides)
+    const record = st.record
+    if (record) {
+      if (this.expectedHash(st.model) !== this.expectedHash(next)) {
+        this.ports.notifier.notice("info", `RunPod: configuration of ${modelID} changed; endpoint ${record.endpointID} is deleted and will be re-provisioned on next use.`)
+        await this.down(modelID)
+      } else if (idleTimeoutFor(next, this.settings) !== idleTimeoutFor(st.model, this.settings)) {
+        await this.compute().setIdleTimeout(record.endpointID, idleTimeoutFor(next, this.settings))
+      }
+    }
+    await this.applyOverridesTo(st, overrides)
+    if (st.phase === "ready") this.armIdle(st)
+    return st.model
+  }
+
+  async remove(modelID: string): Promise<"removed" | "reset"> {
+    const st = this.state(modelID)
+    if (this.runtimeIDs.has(modelID)) {
+      if (st.record) await this.down(modelID)
+      if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
+      this.states.delete(modelID)
+      this.runtimeIDs.delete(modelID)
+      await this.ports.store.remove(modelKey(modelID))
+      await this.publish()
+      return "removed"
+    }
+    const base = findModel(this.settings, modelID)!
+    if (st.record && this.expectedHash(st.model) !== this.expectedHash(base)) await this.down(modelID)
+    st.model = base
+    st.rate = null
+    await this.ports.store.remove(overridesKey(modelID))
+    await this.publish()
+    return "reset"
+  }
+
+  private expectedHash(model: ModelConfig): string {
+    return specHashFor(model, this.settings, this.ports.recipe.recipe(model, this.settings, null))
+  }
+
+  /** Billing data changes slowly and the dashboard polls status(); cache it per endpoint. */
+  private async billedFor(endpointID: string): Promise<number | null> {
+    const now = this.ports.clock.now()
+    const cached = this.billedCache.get(endpointID)
+    if (cached && now - cached.at < BILLING_TTL_MS) return cached.usd
+    const usd = await this.compute().billedUsd(endpointID).catch(() => null)
+    this.billedCache.set(endpointID, { at: now, usd })
+    return usd
   }
 
   // ---- internals -------------------------------------------------------
@@ -347,8 +590,14 @@ export class EndpointService implements ModelRoutingPort {
 
   protected touch(st: ModelState): void {
     st.lastRequestAt = this.ports.clock.now()
+    this.armIdle(st)
+  }
+
+  private armIdle(st: ModelState): void {
     if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
-    st.idleTimer = this.ports.clock.setTimer(() => this.onIdle(st), this.idleMs(st) + IDLE_GRACE_MS)
+    if (st.lastRequestAt === null) return
+    const due = st.lastRequestAt + this.idleMs(st) + IDLE_GRACE_MS - this.ports.clock.now()
+    st.idleTimer = this.ports.clock.setTimer(() => this.onIdle(st), Math.max(0, due))
   }
 
   private onIdle(st: ModelState): void {

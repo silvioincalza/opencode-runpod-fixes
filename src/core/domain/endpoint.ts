@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import type { ModelConfig, Settings } from "./model.ts"
+import { idleTimeoutFor, type ModelConfig, type Settings } from "./model.ts"
 
 export type Phase = "cold" | "confirming" | "creating" | "warming" | "ready" | "idle" | "deleting" | "error"
 
@@ -65,7 +65,7 @@ export function buildEndpointSpec(model: ModelConfig, settings: Settings, recipe
     modelID: model.id,
     recipe,
     gpu: { pool: model.gpu, count: model.gpuCount, minCudaVersion: settings.minCudaVersion },
-    workers: { min: 0, max: settings.workersMax, idleTimeoutSec: settings.idleTimeout },
+    workers: { min: 0, max: settings.workersMax, idleTimeoutSec: idleTimeoutFor(model, settings) },
     executionTimeoutSec: settings.executionTimeoutSec,
     flashboot: settings.flashboot,
     dataCenterIds: [...settings.dataCenterIds],

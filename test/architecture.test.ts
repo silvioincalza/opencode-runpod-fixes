@@ -19,7 +19,7 @@ function walk(dir: string): string[] {
 
 function importsOf(file: string): string[] {
   const specs: string[] = []
-  for (const match of readFileSync(file, "utf8").matchAll(/(?:from|import)\s+"([^"]+)"/g)) specs.push(match[1]!)
+  for (const match of readFileSync(file, "utf8").matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/g)) specs.push(match[1]!)
   return specs
 }
 

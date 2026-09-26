@@ -21,7 +21,14 @@ export class ConfirmBroker {
 
   constructor(timeoutMs: number, timers: ConfirmTimers = {}) {
     this.timeoutMs = timeoutMs
-    this.setTimer = timers.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
+    this.setTimer =
+      timers.setTimer ??
+      ((fn, ms) => {
+        // A pending dialog must not hold the host process open at shutdown.
+        const timer = setTimeout(fn, ms) as { unref?: () => void }
+        timer.unref?.()
+        return timer
+      })
     this.clearTimer = timers.clearTimer ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>))
   }
 
@@ -33,7 +40,14 @@ export class ConfirmBroker {
         resolve({ accepted: false })
       }, this.timeoutMs)
       this.pending.set(requestID, { resolve, timer })
-      issue(requestID)
+      try {
+        issue(requestID)
+      } catch (error) {
+        // The dialog was never shown: drop the entry and its timer now instead of at the timeout.
+        this.pending.delete(requestID)
+        this.clearTimer(timer)
+        throw error
+      }
     })
   }
 

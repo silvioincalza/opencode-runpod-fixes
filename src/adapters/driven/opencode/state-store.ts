@@ -31,13 +31,17 @@ export class OpencodeStateStore implements StateStorePort {
   }
 
   async keys(prefix: string): Promise<string[]> {
-    const out: string[] = []
+    const out = new Set<string>()
+    const seen = new Set<string>()
     let after: string | undefined
     do {
       const page = await this.storage.scan({ prefix, after, limit: PAGE_SIZE })
-      out.push(...page.entries.map((e) => e.key))
-      after = page.next
-    } while (after)
-    return out.sort()
+      for (const entry of page.entries) out.add(entry.key)
+      // Startup lists keys through here: a cursor that stops advancing must end the scan, not hang the host.
+      const next = page.next
+      after = next !== undefined && next !== "" && !seen.has(next) ? next : undefined
+      if (after !== undefined) seen.add(after)
+    } while (after !== undefined)
+    return [...out].sort()
   }
 }

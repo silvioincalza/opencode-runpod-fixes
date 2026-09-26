@@ -130,3 +130,71 @@ test("SystemClock timers never hold the process open", async () => {
   clock.clearTimer(id)
   await clock.sleep(5) // an unref'd sleep still resolves
 })
+
+test("OpencodeStateStore.keys follows scan pages and stops when a cursor repeats", async () => {
+  const pages = [
+    { entries: [{ key: "models/b", value: 1 }], next: "c1" },
+    { entries: [{ key: "models/a", value: 2 }], next: "c2" },
+    { entries: [{ key: "models/c", value: 3 }], next: "c2" }, // a store whose cursor stops advancing
+  ]
+  const afters: (string | undefined)[] = []
+  const store = new OpencodeStateStore({
+    get: async () => undefined,
+    set: async () => {},
+    remove: async () => {},
+    scan: async ({ after }) => {
+      afters.push(after)
+      return pages[afters.length - 1] ?? { entries: [], next: "c2" }
+    },
+  })
+  assert.deepEqual(await store.keys("models/"), ["models/a", "models/b", "models/c"])
+  assert.deepEqual(afters, [undefined, "c1", "c2"])
+})
+
+test("ConfirmBroker cleans up when issuing the dialog throws and after a timeout; default timers are unref'd", async () => {
+  const t = timers()
+  const broker = new ConfirmBroker(1000, t)
+  await assert.rejects(
+    broker.request(() => {
+      throw new Error("rpc down")
+    }),
+    /rpc down/,
+  )
+  assert.equal(broker.size, 0)
+  assert.equal(t.pending.length, 0)
+  const timed = broker.request(() => {})
+  assert.equal(broker.size, 1)
+  t.fire()
+  assert.deepEqual(await timed, { accepted: false })
+  assert.equal(broker.size, 0)
+
+  const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length
+  const before = timeouts()
+  const real = new ConfirmBroker(60_000)
+  let id = ""
+  const pending = real.request((requestID) => {
+    id = requestID
+  })
+  assert.equal(timeouts(), before) // the default timer does not keep the process alive
+  real.resolve(id, { accepted: false })
+  assert.deepEqual(await pending, { accepted: false })
+})
+
+test("RpcNotifier forwards state events and notices unchanged", () => {
+  const seen: unknown[] = []
+  const notifier = new RpcNotifier({ state: (e) => seen.push(e), notice: (level, message) => seen.push({ level, message }) })
+  const event = { modelID: "m", phase: "ready" as const, detail: "ready in 3s", elapsedSec: 3, spendUsd: 0.001, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB" }
+  notifier.state(event)
+  notifier.notice("warning", "careful")
+  assert.deepEqual(seen, [event, { level: "warning", message: "careful" }])
+})
+
+test("ConsoleLogger never throws on unserializable extras", () => {
+  const lines: string[] = []
+  const logger = new ConsoleLogger("[runpod]", (line) => lines.push(line))
+  const circular: Record<string, unknown> = {}
+  circular.self = circular
+  logger.warn("oops", circular)
+  logger.info("big", { n: 10n })
+  assert.deepEqual(lines, ["[runpod] oops [unserializable extra]", "[runpod] big [unserializable extra]"])
+})

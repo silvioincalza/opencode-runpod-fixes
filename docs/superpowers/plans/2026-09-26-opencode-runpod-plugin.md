@@ -5053,7 +5053,7 @@ test("formatGpuOption and formatIdleChoice", () => {
   assert.equal(formatGpuOption(option), "A6000/A40 48GB — $1.22/h · fits · cold start ≈ 2m 36s · current")
   assert.equal(formatGpuOption({ ...option, fits: false, current: false, rateSource: "fallback" }), "A6000/A40 48GB — $1.22/h (static price) · too small · cold start ≈ 2m 36s")
   assert.equal(formatGpuOption({ ...option, fits: null, current: false }), "A6000/A40 48GB — $1.22/h · fit unknown · cold start ≈ 2m 36s")
-  assert.equal(formatIdleChoice(120, 1.22), "120s ≈ $0.04 per idle window")
+  assert.equal(formatIdleChoice(120, 1.22), "2m 0s ≈ $0.04 per idle window")
   assert.equal(formatIdleChoice(1800, 2.72), "30m 0s ≈ $1.36 per idle window")
 })
 
@@ -5139,7 +5139,8 @@ export const ProvisionOverridesSchema: z.ZodType<ProvisionOverrides> = z.object(
   idleTimeout: z.number().int().optional(),
 })
 
-export const StateEventSchema: z.ZodType<StateEvent> = z.object({
+// `satisfies` (not an annotation): the RPC event-schema union needs the concrete ZodObject type; drift is still caught.
+export const StateEventSchema = z.object({
   modelID: z.string(),
   phase: PhaseSchema,
   detail: z.string().nullable(),
@@ -5148,7 +5149,7 @@ export const StateEventSchema: z.ZodType<StateEvent> = z.object({
   ratePerHour: z.number(),
   gpu: z.string(),
   gpuLabel: z.string(),
-})
+}) satisfies z.ZodType<StateEvent>
 
 export const ModelStatusSchema: z.ZodType<ModelStatus> = z.object({
   modelID: z.string(),

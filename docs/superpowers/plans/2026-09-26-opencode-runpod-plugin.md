@@ -6333,6 +6333,39 @@ test("errors from the operations port are reported as text, never thrown", async
   await run(defs, "runpod-add", "org/repo")
   assert.equal(replies.at(-1), "RunPod: already exists")
 })
+
+test("parseArgs keeps quoted spans together and strips their quotes", () => {
+  assert.deepEqual(parseArgs('/runpod-set m name="My Model" context=8192'), ["m", "name=My Model", "context=8192"])
+  assert.deepEqual(parseArgs("/runpod-set m name='Coder'"), ["m", "name=Coder"])
+  assert.deepEqual(parseArgs('/runpod-add "org/repo"'), ["org/repo"])
+  assert.deepEqual(parseArgs('/runpod-set m name=""'), ["m", "name="])
+  assert.throws(() => parseArgs('/runpod-set m name="oops'), /unterminated " quote/)
+})
+
+test("quoted names reach set; add checks the repo id before parsing overrides; non-Error throws reply as text", async () => {
+  const { h, defs } = host()
+  const o = ops({
+    status: async () => {
+      throw "plain string failure"
+    },
+  })
+  const replies: string[] = []
+  await registerCommands(h, o, async (_s, text) => {
+    replies.push(text)
+  })
+  await run(defs, "runpod-set", '/runpod-set m name="Qwen3 Coder (RunPod)"')
+  assert.equal(o.calls.at(-1), 'set:m:{"name":"Qwen3 Coder (RunPod)"}')
+  const before = o.calls.length
+  await run(defs, "runpod-add", "/runpod-add foo=bar")
+  assert.equal(replies.at(-1), "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]")
+  await run(defs, "runpod-add", "/runpod-add not-a-repo context=4096")
+  assert.equal(replies.at(-1), 'hf: expected a Hugging Face repo id like org/name, got "not-a-repo"')
+  assert.equal(o.calls.length, before) // neither malformed add reached the operations port
+  await run(defs, "runpod-set", '/runpod-set m name="oops')
+  assert.match(replies.at(-1)!, /unterminated " quote/)
+  await run(defs, "runpod-status", "")
+  assert.equal(replies.at(-1), "plain string failure")
+})
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -6395,7 +6428,7 @@ If `tsc` reports that `Provider.Info`, `Model.Info` or a variant requires a fiel
 ```ts
 import type { OperationsPort } from "../../../core/ports/driving.ts"
 import { formatModel, formatStatus } from "../rpc/format.ts"
-import { OVERRIDE_KEYS, parseOverrides } from "./config.ts"
+import { ConfigError, OVERRIDE_KEYS, parseOverrides } from "./config.ts"
 
 export interface CommandInvocationLike {
   sessionID: string
@@ -6416,9 +6449,32 @@ export interface CommandHost {
 
 export type Reply = (sessionID: string, text: string) => Promise<void>
 
-/** Whitespace-separated arguments after the slash command token. */
+/** Arguments after the slash command token: split on whitespace; a "…" or '…' span (anywhere in a token, e.g. name="My Model") keeps its spaces and loses its quotes. */
 export function parseArgs(text: string): string[] {
-  return text.trim().replace(/^\/\S+\s*/, "").split(/\s+/).filter((s) => s.length > 0)
+  const rest = text.trim().replace(/^\/\S+\s*/, "")
+  const out: string[] = []
+  let token = ""
+  let inToken = false
+  let quote: string | null = null
+  for (const ch of rest) {
+    if (quote !== null) {
+      if (ch === quote) quote = null
+      else token += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      inToken = true
+    } else if (/\s/.test(ch)) {
+      if (inToken) out.push(token)
+      token = ""
+      inToken = false
+    } else {
+      token += ch
+      inToken = true
+    }
+  }
+  if (quote !== null) throw new ConfigError(`unterminated ${quote} quote in command arguments`)
+  if (inToken) out.push(token)
+  return out
 }
 
 const SET_USAGE = `Usage: /runpod-set <model-id> key=value [key=value …] (keys: ${OVERRIDE_KEYS.join(", ")})`
@@ -6427,7 +6483,7 @@ export async function registerCommands(host: CommandHost, ops: OperationsPort, r
   const guarded = (sessionID: string, action: () => Promise<string>) =>
     action().then(
       (text) => reply(sessionID, text),
-      (error: unknown) => reply(sessionID, (error as Error).message),
+      (error: unknown) => reply(sessionID, error instanceof Error ? error.message : String(error)),
     )
 
   await host.command.transform((editor) => {
@@ -6462,11 +6518,10 @@ export async function registerCommands(host: CommandHost, ops: OperationsPort, r
       execute: ({ sessionID, prompt }) =>
         guarded(sessionID, async () => {
           const [hf, ...rest] = parseArgs(prompt.text)
-          if (!hf) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
-          const gpu = rest[0] !== undefined && !rest[0].includes("=") ? rest.shift() : undefined
-          const overrides = parseOverrides([...(hf.includes("=") ? [hf] : []), ...rest])
-          if (hf.includes("=")) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
+          if (!hf || hf.includes("=")) return "Usage: /runpod-add <org/repo> [gpu-pool] [key=value …]"
           if (!/^[\w.-]+\/[\w.-]+$/.test(hf)) return `hf: expected a Hugging Face repo id like org/name, got "${hf}"`
+          const gpu = rest[0] !== undefined && !rest[0].includes("=") ? rest.shift() : undefined
+          const overrides = parseOverrides(rest)
           const added = await ops.add({ hf, ...(gpu === undefined ? {} : { gpu }), overrides })
           return `Added runpod/${added.id} · ${formatModel(added)}\nSelect it in /models; the first request shows the provision dialog.`
         }),

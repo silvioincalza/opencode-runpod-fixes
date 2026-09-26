@@ -5459,6 +5459,74 @@ test("SystemClock timers never hold the process open", async () => {
   clock.clearTimer(id)
   await clock.sleep(5) // an unref'd sleep still resolves
 })
+
+test("OpencodeStateStore.keys follows scan pages and stops when a cursor repeats", async () => {
+  const pages = [
+    { entries: [{ key: "models/b", value: 1 }], next: "c1" },
+    { entries: [{ key: "models/a", value: 2 }], next: "c2" },
+    { entries: [{ key: "models/c", value: 3 }], next: "c2" }, // a store whose cursor stops advancing
+  ]
+  const afters: (string | undefined)[] = []
+  const store = new OpencodeStateStore({
+    get: async () => undefined,
+    set: async () => {},
+    remove: async () => {},
+    scan: async ({ after }) => {
+      afters.push(after)
+      return pages[afters.length - 1] ?? { entries: [], next: "c2" }
+    },
+  })
+  assert.deepEqual(await store.keys("models/"), ["models/a", "models/b", "models/c"])
+  assert.deepEqual(afters, [undefined, "c1", "c2"])
+})
+
+test("ConfirmBroker cleans up when issuing the dialog throws and after a timeout; default timers are unref'd", async () => {
+  const t = timers()
+  const broker = new ConfirmBroker(1000, t)
+  await assert.rejects(
+    broker.request(() => {
+      throw new Error("rpc down")
+    }),
+    /rpc down/,
+  )
+  assert.equal(broker.size, 0)
+  assert.equal(t.pending.length, 0)
+  const timed = broker.request(() => {})
+  assert.equal(broker.size, 1)
+  t.fire()
+  assert.deepEqual(await timed, { accepted: false })
+  assert.equal(broker.size, 0)
+
+  const timeouts = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length
+  const before = timeouts()
+  const real = new ConfirmBroker(60_000)
+  let id = ""
+  const pending = real.request((requestID) => {
+    id = requestID
+  })
+  assert.equal(timeouts(), before) // the default timer does not keep the process alive
+  real.resolve(id, { accepted: false })
+  assert.deepEqual(await pending, { accepted: false })
+})
+
+test("RpcNotifier forwards state events and notices unchanged", () => {
+  const seen: unknown[] = []
+  const notifier = new RpcNotifier({ state: (e) => seen.push(e), notice: (level, message) => seen.push({ level, message }) })
+  const event = { modelID: "m", phase: "ready" as const, detail: "ready in 3s", elapsedSec: 3, spendUsd: 0.001, ratePerHour: 1.22, gpu: "AMPERE_48", gpuLabel: "A6000/A40 48GB" }
+  notifier.state(event)
+  notifier.notice("warning", "careful")
+  assert.deepEqual(seen, [event, { level: "warning", message: "careful" }])
+})
+
+test("ConsoleLogger never throws on unserializable extras", () => {
+  const lines: string[] = []
+  const logger = new ConsoleLogger("[runpod]", (line) => lines.push(line))
+  const circular: Record<string, unknown> = {}
+  circular.self = circular
+  logger.warn("oops", circular)
+  logger.info("big", { n: 10n })
+  assert.deepEqual(lines, ["[runpod] oops [unserializable extra]", "[runpod] big [unserializable extra]"])
+})
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -5503,14 +5571,18 @@ export class OpencodeStateStore implements StateStorePort {
   }
 
   async keys(prefix: string): Promise<string[]> {
-    const out: string[] = []
+    const out = new Set<string>()
+    const seen = new Set<string>()
     let after: string | undefined
     do {
       const page = await this.storage.scan({ prefix, after, limit: PAGE_SIZE })
-      out.push(...page.entries.map((e) => e.key))
-      after = page.next
-    } while (after)
-    return out.sort()
+      for (const entry of page.entries) out.add(entry.key)
+      // Startup lists keys through here: a cursor that stops advancing must end the scan, not hang the host.
+      const next = page.next
+      after = next !== undefined && next !== "" && !seen.has(next) ? next : undefined
+      if (after !== undefined) seen.add(after)
+    } while (after !== undefined)
+    return [...out].sort()
   }
 }
 ```
@@ -5568,7 +5640,14 @@ export class ConfirmBroker {
 
   constructor(timeoutMs: number, timers: ConfirmTimers = {}) {
     this.timeoutMs = timeoutMs
-    this.setTimer = timers.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
+    this.setTimer =
+      timers.setTimer ??
+      ((fn, ms) => {
+        // A pending dialog must not hold the host process open at shutdown.
+        const timer = setTimeout(fn, ms) as { unref?: () => void }
+        timer.unref?.()
+        return timer
+      })
     this.clearTimer = timers.clearTimer ?? ((id) => clearTimeout(id as ReturnType<typeof setTimeout>))
   }
 
@@ -5580,7 +5659,14 @@ export class ConfirmBroker {
         resolve({ accepted: false })
       }, this.timeoutMs)
       this.pending.set(requestID, { resolve, timer })
-      issue(requestID)
+      try {
+        issue(requestID)
+      } catch (error) {
+        // The dialog was never shown: drop the entry and its timer now instead of at the timeout.
+        this.pending.delete(requestID)
+        this.clearTimer(timer)
+        throw error
+      }
     })
   }
 
@@ -5683,6 +5769,15 @@ export class SystemClock implements ClockPort {
 ```ts
 import type { LoggerPort } from "../../../core/ports/logger.ts"
 
+/** Logging must never throw into the caller (circular objects, bigints). */
+function serialize(extra: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(extra)
+  } catch {
+    return "[unserializable extra]"
+  }
+}
+
 /** Writes prefixed lines to stderr (captured by the opencode server log). */
 export class ConsoleLogger implements LoggerPort {
   private readonly prefix: string
@@ -5702,7 +5797,7 @@ export class ConsoleLogger implements LoggerPort {
   }
 
   private line(message: string, extra?: Record<string, unknown>): string {
-    return `${this.prefix} ${message}${extra ? ` ${JSON.stringify(extra)}` : ""}`
+    return `${this.prefix} ${message}${extra ? ` ${serialize(extra)}` : ""}`
   }
 }
 ```

@@ -35,6 +35,8 @@ export interface ChatCompletionBody {
 interface RequestInitLike {
   signal?: AbortSignal
   text?: boolean
+  /** false for requests that must not be re-sent after an ambiguous failure (network error or 5xx): only 429 is retried. */
+  idempotent?: boolean
 }
 
 export class RunpodHttp {
@@ -60,18 +62,24 @@ export class RunpodHttp {
 
   async listEndpoints(): Promise<EndpointInfo[]> {
     const out: EndpointInfo[] = []
+    const seen = new Set<string>()
     let cursor: string | undefined
-    do {
+    for (let pages = 1; ; pages++) {
       const url = `${this.apiBase}/serverless${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`
       const page = await this.request<unknown>("GET", url)
       out.push(...extractItems<EndpointInfo>(page))
-      cursor = nextCursor(page)
-    } while (cursor)
-    return out
+      const next = nextCursor(page)
+      if (next === undefined) return out
+      if (seen.has(next)) throw new Error(`RunPod: endpoint listing repeated cursor ${JSON.stringify(next)}`)
+      if (pages >= MAX_PAGES) throw new Error(`RunPod: endpoint listing exceeded ${MAX_PAGES} pages`)
+      seen.add(next)
+      cursor = next
+    }
   }
 
   createEndpoint(body: CreateEndpointRequest): Promise<EndpointInfo> {
-    return this.request<EndpointInfo>("POST", `${this.apiBase}/serverless`, body)
+    // A retried create after a lost response would leave a duplicate endpoint.
+    return this.request<EndpointInfo>("POST", `${this.apiBase}/serverless`, body, { idempotent: false })
   }
 
   getEndpoint(id: string): Promise<EndpointInfo> {
@@ -142,12 +150,14 @@ export class RunpodHttp {
           signal: init.signal,
         })
       } catch (error) {
-        if (init.signal?.aborted || attempt >= this.maxRetries) throw error
+        // A network error is ambiguous — the server may have acted — so a non-idempotent request is never re-sent.
+        if (init.signal?.aborted || init.idempotent === false || attempt >= this.maxRetries) throw error
         await this.sleep(1000 * 2 ** attempt)
         continue
       }
-      if (response.status === 429 || response.status >= 500) {
+      if (response.status === 429 || (response.status >= 500 && init.idempotent !== false)) {
         if (attempt >= this.maxRetries) throw await this.toError(response, context)
+        await response.body?.cancel().catch(() => {})
         await this.sleep(1000 * 2 ** attempt)
         continue
       }
@@ -155,7 +165,13 @@ export class RunpodHttp {
       if (response.status === 204) return undefined as T
       const text = await response.text()
       if (init.text) return text as T
-      return (text ? JSON.parse(text) : undefined) as T
+      if (!text) return undefined as T
+      try {
+        return JSON.parse(text) as T
+      } catch {
+        // Never echo the body: it is server text and could carry anything, the API key included.
+        throw new RunpodError(response.status, "invalid JSON response", null, context)
+      }
     }
   }
 
@@ -185,6 +201,9 @@ export type RunpodHttpLike = Pick<
 >
 
 const ITEM_KEYS = ["data", "items", "endpoints", "results", "workers", "gpus", "records"] as const
+
+/** Upper bound on pages followed by listEndpoints: a server that never stops paginating must not hang startup. */
+const MAX_PAGES = 100
 
 function extractItems<T>(page: unknown): T[] {
   if (Array.isArray(page)) return page as T[]

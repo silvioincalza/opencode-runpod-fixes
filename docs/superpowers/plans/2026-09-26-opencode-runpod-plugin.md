@@ -5337,6 +5337,7 @@ import { SystemClock } from "../src/adapters/driven/system/clock.ts"
 import { ConsoleLogger } from "../src/adapters/driven/system/logger.ts"
 import type { ProvisionProposal } from "../src/core/domain/provision.ts"
 import type { Quote } from "../src/core/domain/quote.ts"
+import type { PublishedModel } from "../src/core/ports/catalog-publisher.ts"
 import { sampleModel } from "./fakes/fixtures.ts"
 
 function timers() {
@@ -5399,7 +5400,7 @@ test("RpcNotifier forwards state and notices", () => {
 test("OpencodeCatalogPublisher keeps the latest list (copied) and triggers a provider reload", async () => {
   let reloads = 0
   const publisher = new OpencodeCatalogPublisher(async () => { reloads++ })
-  assert.deepEqual(publisher.current, [])
+  assert.deepEqual(publisher.current, [] as PublishedModel[])
   publisher.seed([{ config: sampleModel({ id: "seeded" }), variants: [] }])
   assert.equal(reloads, 0)
   assert.equal(publisher.current[0]!.config.id, "seeded")
@@ -5449,6 +5450,14 @@ test("SystemClock and ConsoleLogger are usable", async () => {
   logger.info("hello", { a: 1 })
   logger.warn("oops")
   assert.deepEqual(lines, ['[t] hello {"a":1}', "[t] oops"])
+})
+
+test("SystemClock timers never hold the process open", async () => {
+  const clock = new SystemClock()
+  const id = clock.setTimer(() => {}, 10_000) as { hasRef?: () => boolean }
+  assert.equal(id.hasRef?.(), false)
+  clock.clearTimer(id)
+  await clock.sleep(5) // an unref'd sleep still resolves
 })
 ```
 
@@ -5645,15 +5654,24 @@ function copy(models: readonly PublishedModel[]): PublishedModel[] {
 ```ts
 import type { ClockPort } from "../../../core/ports/clock.ts"
 
+/** Service timers are advisory (idle, polls, retries, deadlines): never let one hold the host process open. */
+function unref<T>(timer: T): T {
+  const handle = timer as { unref?: () => void }
+  handle.unref?.()
+  return timer
+}
+
 export class SystemClock implements ClockPort {
   now(): number {
     return Date.now()
   }
   sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((resolve) => {
+      unref(setTimeout(resolve, ms))
+    })
   }
   setTimer(fn: () => void, ms: number): unknown {
-    return setTimeout(fn, ms)
+    return unref(setTimeout(fn, ms))
   }
   clearTimer(id: unknown): void {
     clearTimeout(id as ReturnType<typeof setTimeout>)

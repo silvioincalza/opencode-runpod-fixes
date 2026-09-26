@@ -2405,6 +2405,7 @@ git commit -m "test(core): characterize warm-up retries, timeouts, diagnostics a
 - Modify: `src/core/domain/events.ts` (add `WorkerCounts`, `ModelStatus.workers`)
 - Modify: `src/core/application/endpoint-service.ts`
 - Test: `test/service-lifecycle.test.ts`, `test/service-runtime-config.test.ts`
+- Step 7 (fix round 1) also: Create `test/service-inflight-ops.test.ts`; Modify `src/core/ports/worker-recipe.ts` (doc comment), `test/fakes/compute.ts` (`failList`, `deleteGate`), `test/fakes/confirmation.ts` (`gate`)
 
 **Interfaces:**
 - Produces (`events.ts`): `interface WorkerCounts { initializing; running; idle; throttled }`; `ModelStatus.workers: WorkerCounts | null` (live counts from a best-effort health call; null when not provisioned or the call fails).
@@ -3036,6 +3037,467 @@ Expected: pass. (`expectedHash` matches the test helper because both call the re
 ```bash
 git add src/core/domain/events.ts src/core/application/endpoint-service.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts
 git commit -m "feat(core): reconcile on start, teardown, status with live workers, and runtime model configuration (add/set/remove, variants)"
+```
+
+- [ ] **Step 7: Fix round 1 (post-review) — in-flight operations, best-effort teardown, sticky metering rate**
+
+Applied after Task 5's review (reviewer findings I1–I5, M1/M2/M4/M5 and controller rulings); binding for anyone re-implementing Task 5. Write the tests in H first, run RED with `node --test --test-timeout=5000 test/service-inflight-ops.test.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts` (some RED tests wait on promises that never settle), then implement A–G and run `npm run check`.
+
+#### A. Shared helpers and constants
+
+```ts
+/** Abort reason used when an endpoint is deleted during its cold start. */
+const CANCELLED = Symbol("cancelled")
+
+/** $/h for `gpuCount` GPUs at `rate`, rounded to 4 decimals (0 when the price is unknown). */
+const hourlyRate = (rate: PoolRate | null, gpuCount: number) => Math.round((rate?.ratePerHour ?? 0) * gpuCount * 1e4) / 1e4
+```
+
+`hourly(st)` becomes `return hourlyRate(st.rate, st.model.gpuCount)`.
+
+`ModelState` gains `warmAbort: AbortController | null`, and `newState()` initialises it to `null`.
+
+Add these methods:
+
+```ts
+  private busy(st: ModelState): Error {
+    return new Error(`RunPod: ${st.model.id} is busy (${st.phase}); try again when the current operation finishes.`)
+  }
+
+  /** Throws when another operation owns the model: a request in flight or a teardown in progress. */
+  private ensureNotBusy(st: ModelState): void {
+    if (st.inflight !== null || st.phase === "deleting") throw this.busy(st)
+  }
+
+  /** The pool's catalog rate, or null when unknown. A failed lookup is never cached as the metering rate (I3). */
+  private async knownRate(model: ModelConfig): Promise<PoolRate | null> {
+    const rate = await this.rateFor(model)
+    return rate.ratePerHour > 0 ? rate : null
+  }
+```
+
+#### B. Cancelling a cold start and the `deleting` phase (R-A, S2)
+
+Rules:
+- **`down(id)` while the model is `warming`:** abort the warm-up, then delete as usual. The pending `ensureReady` rejects with `RunPod: cold start of <id> was cancelled: endpoint <endpointID> is being deleted.` There are no diagnostics and no extra `cold` event.
+- **Busy states.** A model is busy when either:
+  - its phase is `deleting`; or
+  - it has a request in flight and its phase is anything other than `warming`.
+- **Who rejects on busy:**
+  - `down(id)` rejects with `busy`, and `down()` for all skips the model;
+  - `set()` and `remove()` reject whenever `ensureNotBusy` fails;
+  - `ensureReady()` rejects while the phase is `deleting`.
+- **Variant pool.** `ensureReady(id, { gpu })` applies a differing variant pool through the unguarded `reconfigure()` (section D). It must not depend on the order in which `st.inflight` is assigned.
+
+Edits:
+- **`warm()`:**
+  - Put `st.warmAbort = controller` directly after `const controller = new AbortController()`, in the same synchronous block.
+  - After the retry loop, before `st.meter.stop(...)`, add:
+    ```ts
+          if (controller.signal.reason === CANCELLED) {
+            // teardown() owns the phase, meter and record from here on.
+            throw new Error(`RunPod: cold start of ${st.model.id} was cancelled: endpoint ${record.endpointID} is being deleted.`)
+          }
+    ```
+  - In `finally`, after `controller.abort()`, add `if (st.warmAbort === controller) st.warmAbort = null`.
+  - Change `if (!st.rate) st.rate = await this.rateFor(st.model)` to `if (!st.rate) st.rate = await this.knownRate(st.model)`.
+  - In the failure path, guard the phase write, because a `down()` that lands while diagnostics are being fetched owns the phase (the same pattern as the pollHealth re-check): `if (st.phase === "warming") this.setPhase(st, "cold", `cold start ${reason}`)`.
+- **`run()`:** replace the tail with:
+  ```ts
+      if (st.phase !== "ready") await this.warm(st, compute)
+      const record = st.record
+      // teardown() may have deleted the endpoint while this request was starting it.
+      if (!record) throw new Error(`RunPod: ${st.model.id} was torn down while starting; retry.`)
+      this.touch(st)
+      return compute.inferenceBaseURL(record.endpointID)
+  ```
+- **`ensureReady()`:**
+  ```ts
+    async ensureReady(modelID: string, opts: { skipConfirm?: boolean; gpu?: string } = {}): Promise<string> {
+      const st = this.state(modelID)
+      if (st.inflight) return st.inflight
+      if (st.phase === "deleting") throw this.busy(st)
+      const run = (async () => {
+        if (opts.gpu !== undefined && opts.gpu !== st.model.gpu) await this.reconfigure(st, { gpu: opts.gpu })
+        return this.run(st, opts)
+      })().finally(() => {
+        st.inflight = null
+      })
+      st.inflight = run
+      return run
+    }
+  ```
+
+#### C. `down()` is best effort for all models (I2, spec §5.2), and `teardown()` does the per-model work (M4)
+
+```ts
+  async down(modelID?: string): Promise<string[]> {
+    const compute = this.compute()
+    const targets = modelID === undefined ? [...this.states.values()] : [this.state(modelID)]
+    const deleted: string[] = []
+    const failures: string[] = []
+    for (const st of targets) {
+      // Another operation owns the model — except a cold start, which teardown() cancels.
+      if (st.phase === "deleting" || (st.inflight !== null && st.phase !== "warming")) {
+        if (modelID !== undefined) throw this.busy(st)
+        continue
+      }
+      if (!st.record) continue
+      try {
+        await this.teardown(st, compute)
+        deleted.push(st.model.id)
+      } catch (error) {
+        if (modelID !== undefined) throw error
+        failures.push(`${st.model.id} (${(error as Error).message})`)
+      }
+    }
+    if (failures.length > 0) {
+      const done = deleted.length > 0 ? `; deleted ${deleted.join(", ")}` : ""
+      throw new Error(`RunPod: could not delete ${failures.join(", ")}${done}`)
+    }
+    return deleted
+  }
+
+  /** Scales the endpoint to zero and deletes it, cancelling its cold start if one is running. Callers check busy-ness. */
+  private async teardown(st: ModelState, compute: ComputeProviderPort): Promise<void> {
+    const record = st.record!
+    this.setPhase(st, "deleting", `deleting ${record.endpointID}`)
+    st.warmAbort?.abort(CANCELLED)
+    try {
+      await compute.scaleToZero(record.endpointID)
+    } catch (error) {
+      this.ports.logger.warn("scale-to-zero before delete failed", { error: String(error) })
+    }
+    try {
+      await compute.delete(record.endpointID)
+    } catch (error) {
+      this.setPhase(st, "error", `delete failed: ${(error as Error).message}`)
+      throw error
+    }
+    if (st.idleTimer !== null) {
+      this.ports.clock.clearTimer(st.idleTimer)
+      st.idleTimer = null
+    }
+    st.meter.stop(this.ports.clock.now())
+    st.record = null
+    this.billedCache.delete(record.endpointID)
+    await this.ports.store.remove(recordKey(st.model.id))
+    this.setPhase(st, "cold", `deleted · ≈$${st.meter.usd().toFixed(2)} this session`)
+  }
+```
+
+`stop()` must clear its budget timer when cleanup wins the race (M2):
+
+```ts
+  async stop(budgetMs = 10_000): Promise<void> {
+    if (!this.settings.deleteOnExit) return
+    let timer: unknown = null
+    const budget = new Promise<void>((resolve) => {
+      timer = this.ports.clock.setTimer(resolve, budgetMs)
+    })
+    try {
+      await Promise.race([
+        this.down().catch((error: unknown) => {
+          this.ports.logger.warn("shutdown cleanup failed", { error: String(error) })
+        }),
+        budget,
+      ])
+    } finally {
+      this.ports.clock.clearTimer(timer)
+    }
+  }
+```
+
+#### D. `set()`, `reconfigure()` and `syncEndpoint()` (R-A, S3, M5), and `remove()` (I1, M1)
+
+```ts
+  async set(modelID: string, overrides: ModelOverrides): Promise<ModelConfig> {
+    const st = this.state(modelID)
+    this.ensureNotBusy(st)
+    return this.reconfigure(st, overrides)
+  }
+
+  /** set() without the busy guard: ensureReady applies a variant pool through it from inside its own request. */
+  private async reconfigure(st: ModelState, overrides: ModelOverrides): Promise<ModelConfig> {
+    this.validateOverrides(overrides)
+    await this.syncEndpoint(st, applyOverrides(st.model, overrides))
+    await this.applyOverridesTo(st, overrides)
+    if (st.phase === "ready") this.armIdle(st)
+    return st.model
+  }
+
+  /** Brings a live endpoint in line with `next`: a spec-hash change deletes it (re-provisioned on next use), an idle-only change patches it. */
+  private async syncEndpoint(st: ModelState, next: ModelConfig): Promise<void> {
+    const record = st.record
+    if (!record) return
+    if (this.expectedHash(st.model) !== this.expectedHash(next)) {
+      await this.teardown(st, this.compute())
+      this.ports.notifier.notice("info", `RunPod: configuration of ${st.model.id} changed; endpoint ${record.endpointID} was deleted and will be re-provisioned on next use.`)
+    } else if (idleTimeoutFor(next, this.settings) !== idleTimeoutFor(st.model, this.settings)) {
+      await this.compute().setIdleTimeout(record.endpointID, idleTimeoutFor(next, this.settings))
+    }
+  }
+
+  async remove(modelID: string): Promise<"removed" | "reset"> {
+    const st = this.state(modelID)
+    this.ensureNotBusy(st)
+    if (this.runtimeIDs.has(modelID)) {
+      if (st.record) await this.teardown(st, this.compute())
+      await this.ports.store.remove(modelKey(modelID))
+      if (st.idleTimer !== null) this.ports.clock.clearTimer(st.idleTimer)
+      this.states.delete(modelID)
+      this.runtimeIDs.delete(modelID)
+      await this.publish()
+      return "removed"
+    }
+    const base = findModel(this.settings, modelID)!
+    await this.syncEndpoint(st, base)
+    await this.ports.store.remove(overridesKey(modelID))
+    st.model = base
+    st.rate = null
+    if (st.phase === "ready") this.armIdle(st)
+    await this.publish()
+    return "reset"
+  }
+```
+
+#### E. `status()` never writes `st.rate` (I3)
+
+The loop currently starts with `st.rate = await this.rateFor(st.model)`. Replace that line with:
+
+```ts
+      // Display rate: fresh from the catalog, else the rate captured when the endpoint was priced. Never written back —
+      // st.rate is what the meter charges, and a failed lookup (ratePerHour 0) must not replace it.
+      const lookup = await this.rateFor(st.model)
+      const rate = lookup.ratePerHour > 0 || st.rate === null ? lookup : st.rate
+```
+
+Then set `ratePerHour: hourlyRate(rate, st.model.gpuCount)` and `gpuLabel: rate.label`.
+
+In `start()`'s reconcile, the two `st.rate = await this.rateFor(st.model)` lines (restore and adopt) become `st.rate = await this.knownRate(st.model)`.
+
+#### F. `start()` always publishes (R-B)
+
+Move the body of `if (compute) { … }` into `private async reconcile(compute: ComputeProviderPort): Promise<void>` and call it guarded:
+
+```ts
+    const compute = this.ports.compute
+    if (compute) {
+      try {
+        await this.reconcile(compute)
+      } catch (error) {
+        this.ports.logger.warn("startup reconcile failed", { error: String(error) })
+        this.ports.notifier.notice("warning", `RunPod: could not reconcile endpoints at startup (${(error as Error).message}); stored endpoints are re-checked on the next start.`)
+      }
+    }
+    await this.publish()
+```
+
+#### G. `add()` persists first (I4); the recipe invariant is documented (I5); the fakes gain gates
+
+- In `add()`, move `await this.ports.store.set(modelKey(id), config)` so it runs before `this.newState(config)` and `this.runtimeIDs.add(id)`.
+- In `src/core/ports/worker-recipe.ts`, add this doc comment on `recipe(...)`:
+  `` /** `weightsGb` may only size the disk: image and env must not depend on it, because the startup reconcile recomputes the spec hash with `weightsGb = null`. */ ``
+- In `test/fakes/compute.ts` (`FakeCompute`):
+  - add `failList: Error | null = null`. In `list()`, after `this.calls.push("list")`, add `if (this.failList) throw this.failList`.
+  - add `deleteGate: Promise<void> | null = null`. In `delete()`, after `this.calls.push(...)`, add `if (this.deleteGate) await this.deleteGate`.
+- In `test/fakes/confirmation.ts` (`ScriptedConfirmation`): add `gate: Promise<void> | null = null`. In `ask()`, after `this.asked.push(proposal)`, add `if (this.gate) await this.gate`.
+
+#### H. Tests
+
+##### New file `test/service-inflight-ops.test.ts`
+
+```ts
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { flush } from "./fakes/clock.ts"
+import { harness } from "./fakes/fixtures.ts"
+
+async function warm(h: ReturnType<typeof harness>) {
+  const p = h.service.ensureReady("m")
+  await flush()
+  h.compute.finishWarmup()
+  await p
+}
+
+test("down during a cold start cancels the pending request, deletes the endpoint and emits one cold event", async () => {
+  const h = harness()
+  const pending = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.service.phase("m"), "warming")
+  const cancelled = assert.rejects(pending, /cold start of m was cancelled: endpoint ep1 is being deleted/)
+  assert.deepEqual(await h.service.down("m"), ["m"])
+  await cancelled
+  assert.equal(h.service.phase("m"), "cold")
+  const phases = h.notifier.phases
+  assert.deepEqual(phases.slice(phases.indexOf("warming")), ["warming", "deleting", "cold"])
+  assert.throws(() => h.compute.finishWarmup(), /no pending warm-up/) // the warm-up request was aborted
+  assert.equal(h.compute.calls.filter((c) => c.startsWith("diagnostics:")).length, 0)
+  assert.ok(h.compute.calls.includes("delete:ep1"))
+  assert.equal(await h.store.get("endpoints/m"), undefined)
+  // the model is usable again: the next request provisions a fresh endpoint
+  const again = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.confirmation.asked.length, 2)
+  h.compute.finishWarmup()
+  assert.equal(await again, "https://compute.test/ep2/v1")
+})
+
+test("down, set and remove refuse while the provision dialog is open; down() for all skips the model", async () => {
+  const h = harness()
+  let answer!: () => void
+  h.confirmation.gate = new Promise<void>((resolve) => {
+    answer = resolve
+  })
+  const pending = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.service.phase("m"), "confirming")
+  await assert.rejects(h.service.down("m"), /RunPod: m is busy \(confirming\)/)
+  assert.deepEqual(await h.service.down(), [])
+  await assert.rejects(h.service.set("m", { idleTimeout: 60 }), /m is busy \(confirming\)/)
+  await assert.rejects(h.service.remove("m"), /m is busy \(confirming\)/)
+  answer()
+  await flush()
+  assert.equal(h.service.phase("m"), "warming")
+  h.compute.finishWarmup()
+  assert.equal(await pending, "https://compute.test/ep1/v1")
+  assert.equal((await h.service.set("m", { idleTimeout: 60 })).idleTimeout, 60)
+})
+
+test("while an endpoint is being deleted, requests and edits are refused", async () => {
+  const h = harness()
+  await warm(h)
+  let release!: () => void
+  h.compute.deleteGate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const deleting = h.service.down("m")
+  await flush()
+  assert.equal(h.service.phase("m"), "deleting")
+  await assert.rejects(h.service.ensureReady("m"), /RunPod: m is busy \(deleting\)/)
+  await assert.rejects(h.service.set("m", { idleTimeout: 60 }), /m is busy \(deleting\)/)
+  await assert.rejects(h.service.down("m"), /m is busy \(deleting\)/)
+  release()
+  assert.deepEqual(await deleting, ["m"])
+  assert.equal(h.service.phase("m"), "cold")
+  assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 1)
+})
+```
+
+##### Append to `test/service-lifecycle.test.ts`
+
+Change its line 3 import to `import { BILLING_TTL_MS, EndpointService, IDLE_GRACE_MS } from "../src/core/application/endpoint-service.ts"`, then append:
+
+```ts
+test("start still publishes the catalog and warns when RunPod cannot be listed", async () => {
+  const h = harness()
+  await h.store.set("models/extra", sampleModel({ id: "extra", name: "Extra" }))
+  h.compute.failList = new Error("fetch failed")
+  await h.service.start()
+  assert.deepEqual(h.publisher.latest?.map((m) => m.config.id), ["m", "extra"])
+  const notice = h.notifier.notices.at(-1)
+  assert.equal(notice?.level, "warning")
+  assert.match(notice?.message ?? "", /could not reconcile endpoints at startup \(fetch failed\)/)
+  assert.equal(h.service.phase("m"), "cold")
+})
+
+test("down() for all keeps going after a failed delete and reports every failure", async () => {
+  const two = harness({ models: [sampleModel(), sampleModel({ id: "n", hf: "Qwen/Qwen3-8B", gpu: "AMPERE_16" })] })
+  await warm(two, "m")
+  await warm(two, "n")
+  two.compute.failDelete = new Error("forbidden")
+  await assert.rejects(two.service.down(), /could not delete m \(forbidden\), n \(forbidden\)/)
+  assert.ok(two.compute.calls.includes("delete:ep1"))
+  assert.ok(two.compute.calls.includes("delete:ep2"))
+  assert.equal(two.service.phase("n"), "error")
+})
+
+test("a restarted service recognises the endpoint it created (create-time hash equals the reconcile hash)", async () => {
+  const h = harness()
+  await warm(h)
+  const restarted = new EndpointService(h.settings, {
+    compute: h.compute,
+    catalog: h.catalog,
+    weights: h.weights,
+    recipe: h.recipe,
+    store: h.store,
+    clock: h.clock,
+    confirmation: h.confirmation,
+    notifier: h.notifier,
+    publisher: h.publisher,
+    logger: h.logger,
+  })
+  await restarted.start()
+  assert.equal(restarted.phase("m"), "idle")
+  assert.equal(h.compute.calls.filter((c) => c.startsWith("delete:")).length, 0)
+  const p = restarted.ensureReady("m") // restored → warms without a dialog or a second endpoint
+  await flush()
+  assert.equal(h.confirmation.asked.length, 1)
+  assert.equal(h.compute.created.length, 1)
+  h.compute.finishWarmup()
+  assert.equal(await p, "https://compute.test/ep1/v1")
+})
+
+test("a failed price lookup in status() does not replace the rate the meter charges", async () => {
+  const h = harness()
+  await warm(h) // ready at t=0, metering $1.22/h
+  h.catalog.fail = true
+  assert.equal((await h.service.status()).models[0]!.ratePerHour, 1.22) // falls back to the rate captured at provisioning
+  await h.clock.advance(120_000 + IDLE_GRACE_MS) // idle; the meter stopped at t=120s
+  const before = (await h.service.status()).models[0]!.spendUsd
+  await warm(h) // re-warm while the catalog is still down
+  await h.clock.advance(60_000)
+  const after = (await h.service.status()).models[0]!.spendUsd
+  assert.ok(after > before, `the re-warmed worker is metered (${before} → ${after})`)
+})
+```
+
+##### Append to `test/service-runtime-config.test.ts`
+
+```ts
+test("resetting a static model restores the base idle timeout on its live endpoint and re-arms the idle timer", async () => {
+  const h = harness()
+  await warm(h)
+  await h.service.set("m", { idleTimeout: 30 })
+  assert.ok(h.compute.calls.includes("setIdleTimeout:ep1:30"))
+  assert.equal(await h.service.remove("m"), "reset")
+  assert.ok(h.compute.calls.includes("setIdleTimeout:ep1:120"))
+  assert.equal(h.service.models()[0]!.idleTimeout, null)
+  await h.clock.advance(30_000 + IDLE_GRACE_MS) // the 30 s window no longer applies
+  assert.equal(h.service.phase("m"), "ready")
+  await h.clock.advance(90_000) // t = 135 s = base 120 s window + grace
+  assert.equal(h.service.phase("m"), "idle")
+})
+
+test("add persists before registering the model, so a failed write leaves nothing behind", async () => {
+  const h = harness()
+  h.store.failWrites = (key) => key.startsWith("models/")
+  await assert.rejects(h.service.add({ hf: "Qwen/Qwen3-8B" }), /write failed: models\/qwen3-8b/)
+  assert.deepEqual(h.service.models().map((m) => m.id), ["m"])
+  h.store.failWrites = null
+  assert.equal((await h.service.add({ hf: "Qwen/Qwen3-8B" })).id, "qwen3-8b")
+})
+```
+
+#### I. Expected RED (before any production change; fakes from G already added)
+
+| Test | Expected RED |
+|---|---|
+| cancel during cold start | times out: nothing aborts the warm-up, so the pending request never settles |
+| busy during dialog | `down("m")` resolves `[]` instead of rejecting |
+| busy while deleting | times out: `ensureReady` starts a warm-up against the deleting endpoint instead of rejecting |
+| start publishes when list fails | `start()` rejects with "fetch failed" |
+| down() all best effort | rejects with plain "forbidden"; `delete:ep2` never attempted |
+| restarted service recognises its endpoint | passes already (pins the invariant) |
+| failed lookup in status() | display shows 0 instead of 1.22 |
+| reset restores idle timeout | no `setIdleTimeout:ep1:120` call |
+| add persists first | `models()` still lists `qwen3-8b` after the failed write |
+
+
+Commit:
+```bash
+git add src/core/application/endpoint-service.ts src/core/ports/worker-recipe.ts test/fakes/compute.ts test/fakes/confirmation.ts test/service-inflight-ops.test.ts test/service-lifecycle.test.ts test/service-runtime-config.test.ts
+git commit -m "fix(core): cancel cold starts on down, refuse edits while busy, best-effort teardown, sticky metering rate"
 ```
 
 ---

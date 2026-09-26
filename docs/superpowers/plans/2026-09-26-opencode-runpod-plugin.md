@@ -1246,10 +1246,13 @@ import type { StateStorePort } from "../../src/core/ports/state-store.ts"
 
 export class InMemoryStateStore implements StateStorePort {
   readonly data = new Map<string, unknown>()
+  /** When set, writes to matching keys fail (simulates a storage error). */
+  failWrites: ((key: string) => boolean) | null = null
   async get<T>(key: string): Promise<T | undefined> {
     return this.data.get(key) as T | undefined
   }
   async set(key: string, value: unknown): Promise<void> {
+    if (this.failWrites?.(key)) throw new Error(`write failed: ${key}`)
     this.data.set(key, structuredClone(value))
   }
   async remove(key: string): Promise<void> {
@@ -1280,6 +1283,8 @@ export class FakeCompute implements ComputeProviderPort {
   billed: number | null = null
   failCreate: Error | null = null
   failDelete: Error | null = null
+  /** When set, health() waits for this promise (simulates a slow poll in flight). */
+  healthGate: Promise<void> | null = null
   private warmups: PendingWarmup[] = []
   private nextId = 1
 
@@ -1309,6 +1314,7 @@ export class FakeCompute implements ComputeProviderPort {
 
   async health(id: string): Promise<HealthSnapshot> {
     this.calls.push(`health:${id}`)
+    if (this.healthGate) await this.healthGate
     return { ...this.healthSnapshot }
   }
 
@@ -1605,6 +1611,7 @@ export function harness(
 ```ts
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { HEALTH_POLL_MS } from "../src/core/application/endpoint-service.ts"
 import type { EndpointRecord } from "../src/core/domain/endpoint.ts"
 import { flush } from "./fakes/clock.ts"
 import { accept, decline } from "./fakes/confirmation.ts"
@@ -1685,8 +1692,60 @@ test("an override that breaks maxHourlyRate or names an unknown pool is refused 
   const unknown = harness({}, { answers: [accept({ gpu: "NOPE" })] })
   await assert.rejects(unknown.service.ensureReady("m"), /unknown GPU pool "NOPE" \(known: AMPERE_16, AMPERE_48, AMPERE_80\)/)
   assert.equal(await unknown.store.get("overrides/m"), undefined)
+  assert.equal(unknown.service.phase("m"), "cold")
+  assert.deepEqual(unknown.notifier.phases, ["confirming", "cold"])
   const badIdle = harness({}, { answers: [accept({ idleTimeout: 0 })] })
   await assert.rejects(badIdle.service.ensureReady("m"), /idleTimeout must be an integer between 1 and 3600/)
+  assert.equal(badIdle.service.phase("m"), "cold")
+})
+
+test("a health poll that resolves after warm-up finished does not revert ready to warming", async () => {
+  const h = harness()
+  let release: () => void = () => {}
+  h.compute.healthGate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const pending = h.service.ensureReady("m")
+  await flush()
+  await h.clock.advance(HEALTH_POLL_MS) // the poller wakes up and parks inside health()
+  assert.ok(h.compute.calls.includes("health:ep1"))
+  h.compute.finishWarmup()
+  await pending
+  assert.equal(h.service.phase("m"), "ready")
+  release()
+  await flush()
+  assert.equal(h.service.phase("m"), "ready")
+  assert.equal(h.notifier.events.at(-1)!.phase, "ready")
+})
+
+test("a failed override write leaves the in-memory config untouched and resets to cold", async () => {
+  const h = harness({}, { answers: [accept({ gpu: "AMPERE_80" })] })
+  h.store.failWrites = (key) => key.startsWith("overrides/")
+  await assert.rejects(h.service.ensureReady("m"), /write failed: overrides\/m/)
+  assert.equal(h.compute.created.length, 0)
+  assert.equal(h.service.phase("m"), "cold")
+  assert.deepEqual(h.notifier.phases, ["confirming", "cold"])
+  h.store.failWrites = null
+  const retry = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.confirmation.asked[1]!.quote.gpu, "AMPERE_48") // memory still holds the configured pool
+  assert.equal(h.compute.created[0]!.gpu.pool, "AMPERE_80")
+  h.compute.finishWarmup()
+  await retry
+})
+
+test("if the endpoint record cannot be stored, the created endpoint is kept and reused on retry", async () => {
+  const h = harness()
+  h.store.failWrites = (key) => key.startsWith("endpoints/")
+  await assert.rejects(h.service.ensureReady("m"), /write failed: endpoints\/m/)
+  assert.equal(h.compute.created.length, 1)
+  assert.equal(h.service.phase("m"), "cold")
+  h.store.failWrites = null
+  const retry = h.service.ensureReady("m")
+  await flush()
+  assert.equal(h.compute.created.length, 1) // no second endpoint
+  h.compute.finishWarmup()
+  assert.equal(await retry, "https://compute.test/ep1/v1")
 })
 
 test("declined confirmation: nothing created, phase back to cold, actionable error", async () => {
@@ -1905,39 +1964,50 @@ export class EndpointService implements ModelRoutingPort {
   private async run(st: ModelState, opts: { skipConfirm?: boolean }): Promise<string> {
     const compute = this.compute()
     if (!st.record) {
-      let priced = await this.price(st.model)
-      st.rate = priced.rate
-      if (priced.quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${priced.quote.blocked}`)
-      if (this.settings.confirm && !opts.skipConfirm) {
-        this.setPhase(st, "confirming", `waiting for confirmation · ${priced.quote.gpuLabel} · $${priced.quote.ratePerHour.toFixed(2)}/h`)
-        const proposal = buildProposal({ quote: priced.quote, model: st.model, pricing: await this.pricing(), weightsGb: priced.weightsGb })
-        const decision = await this.ports.confirmation.ask(proposal)
-        if (!decision.accepted) {
-          this.setPhase(st, "cold", "provisioning declined")
-          throw new Error(
-            `RunPod: provisioning of ${st.model.id} was declined or not confirmed within ${this.settings.confirmTimeoutSec}s. ` +
-              `Run /runpod-up ${st.model.id} to provision without the dialog, or set options.confirm=false.`,
-          )
-        }
-        const overrides = this.changedOverrides(st.model, decision.overrides)
-        if (overrides) {
-          this.validateOverrides(overrides)
-          const candidate = applyOverrides(st.model, overrides)
-          const repriced = await this.price(candidate)
-          if (repriced.quote.blocked) {
-            this.setPhase(st, "cold", `refused: ${repriced.quote.blocked}`)
-            throw new Error(`RunPod: refusing to provision ${st.model.id}: ${repriced.quote.blocked}`)
-          }
-          await this.applyOverridesTo(st, overrides)
-          priced = repriced
-          st.rate = repriced.rate
-        }
+      try {
+        await this.provision(st, opts, compute)
+      } catch (error) {
+        // Every failure before the endpoint is usable ends in `cold` (paths that already reset are left alone).
+        if (st.phase === "confirming" || st.phase === "creating") this.setPhase(st, "cold", `provisioning failed: ${(error as Error).message}`)
+        throw error
       }
-      await this.create(st, priced, compute)
     }
     if (st.phase !== "ready") await this.warm(st, compute)
     this.touch(st)
     return compute.inferenceBaseURL(st.record!.endpointID)
+  }
+
+  /** Quote → (proposal → decision → validated, re-priced, persisted overrides) → create. */
+  private async provision(st: ModelState, opts: { skipConfirm?: boolean }, compute: ComputeProviderPort): Promise<void> {
+    let priced = await this.price(st.model)
+    st.rate = priced.rate
+    if (priced.quote.blocked) throw new Error(`RunPod: refusing to provision ${st.model.id}: ${priced.quote.blocked}`)
+    if (this.settings.confirm && !opts.skipConfirm) {
+      this.setPhase(st, "confirming", `waiting for confirmation · ${priced.quote.gpuLabel} · $${priced.quote.ratePerHour.toFixed(2)}/h`)
+      const proposal = buildProposal({ quote: priced.quote, model: st.model, pricing: await this.pricing(), weightsGb: priced.weightsGb })
+      const decision = await this.ports.confirmation.ask(proposal)
+      if (!decision.accepted) {
+        this.setPhase(st, "cold", "provisioning declined")
+        throw new Error(
+          `RunPod: provisioning of ${st.model.id} was declined or not confirmed within ${this.settings.confirmTimeoutSec}s. ` +
+            `Run /runpod-up ${st.model.id} to provision without the dialog, or set options.confirm=false.`,
+        )
+      }
+      const overrides = this.changedOverrides(st.model, decision.overrides)
+      if (overrides) {
+        this.validateOverrides(overrides)
+        const candidate = applyOverrides(st.model, overrides)
+        const repriced = await this.price(candidate)
+        if (repriced.quote.blocked) {
+          this.setPhase(st, "cold", `refused: ${repriced.quote.blocked}`)
+          throw new Error(`RunPod: refusing to provision ${st.model.id}: ${repriced.quote.blocked}`)
+        }
+        await this.applyOverridesTo(st, overrides)
+        priced = repriced
+        st.rate = repriced.rate
+      }
+    }
+    await this.create(st, priced, compute)
   }
 
   /** Only the parts of a dialog decision that differ from the effective config. */
@@ -1968,16 +2038,17 @@ export class EndpointService implements ModelRoutingPort {
     }
   }
 
-  /** Applies validated overrides to the in-memory config, persists them and republishes the catalog. */
+  /** Persists validated overrides, then applies them in memory (so a failed write changes nothing) and republishes the catalog. */
   protected async applyOverridesTo(st: ModelState, overrides: ModelOverrides): Promise<void> {
-    st.model = applyOverrides(st.model, overrides)
-    st.rate = null
+    const next = applyOverrides(st.model, overrides)
     if (this.runtimeIDs.has(st.model.id)) {
-      await this.ports.store.set(modelKey(st.model.id), st.model)
+      await this.ports.store.set(modelKey(st.model.id), next)
     } else {
       const stored = (await this.ports.store.get<ModelOverrides>(overridesKey(st.model.id))) ?? {}
       await this.ports.store.set(overridesKey(st.model.id), { ...stored, ...overrides })
     }
+    st.model = next
+    st.rate = null
     await this.publish()
   }
 
@@ -2107,6 +2178,8 @@ export class EndpointService implements ModelRoutingPort {
       if (signal.aborted || st.phase !== "warming") return
       try {
         const h = await compute.health(endpointID)
+        // Warm-up may have finished (ready) or failed (cold) while the call was in flight.
+        if (signal.aborted || st.phase !== "warming") return
         this.setPhase(st, "warming", `workers: initializing ${h.initializing} · running ${h.running} · idle ${h.idle} · throttled ${h.throttled}`, this.elapsed(started))
       } catch (error) {
         this.ports.logger.warn("health poll failed", { endpointID, error: String(error) })

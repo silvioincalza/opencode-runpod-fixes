@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "../",
+      "options": {
+        "confirm": true,
+        "idleTimeout": 60,
+        "models": {
+          "qwen3-0.6b": {
+            "name": "Qwen3 0.6B (RunPod dev)",
+            "hf": "Qwen/Qwen3-0.6B",
+            "gpu": "AMPERE_16",
+            "context": 8192,
+            "output": 2048,
+            "family": "qwen3"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "opencode-runpod",
+  "version": "0.1.0",
+  "description": "opencode v2 plugin: per-model RunPod Serverless vLLM endpoints with cost confirmation, scale-to-zero and delete-on-exit",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts",
+    "./rpc": "./rpc.ts"
+  },
+  "files": ["index.ts", "tui.ts", "rpc.ts", "src", "README.md"],
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke": "node scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.16",
+    "zod": "^4.1.8"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opencode/theme": "^2.0.16",
+    "@opentui/core": "^0.5.12",
+    "@opentui/solid": "^0.5.12",
+    "@types/node": "^24.0.0",
+    "solid-js": "^1.9.0",
+    "typescript": "^5.9.0"
+  }
+}
